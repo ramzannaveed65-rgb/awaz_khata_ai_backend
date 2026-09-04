@@ -1,129 +1,122 @@
 import os
 import json
 import datetime
+import io
+import asyncio
 import re
 from dotenv import load_dotenv
 from google import genai
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+import PIL.Image
 
 # Local Imports
 import models
 from database import engine, get_db, Base
 
-# 1. INITIALIZATION
 load_dotenv()
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="AwazKhata AI Backend 2026")
 
-# Setup Gemini 2026 Client
 api_key = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+client = genai.Client(api_key=api_key)
+
+# --- DYNAMIC MODEL SELECTION ---
+# Based on your terminal logs, we will prioritize 3.5-flash
+MODEL_NAME = "models/gemini-3.5-flash" 
 
 class VoiceInput(BaseModel):
     transcript: str
+
+def clean_json_response(text):
+    # Remove markdown code blocks if present
+    cleaned = re.sub(r'```json|```', '', text).strip()
+    return cleaned
 
 @app.get("/")
 def home():
     return {"status": "Online", "message": "AwazKhata API is active"}
 
-# 2. MAIN VOICE PROCESSOR
-@app.post("/voice/process")
-async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
-    # Define the prompt for the AI
-    prompt = f"""
-    Acting as AwazKhata AI. Convert this shopkeeper's command into JSON: "{data.transcript}"
-    
-    Actions: STOCK_IN, STOCK_OUT, QUERY, SUMMARY.
-    Return ONLY this JSON format:
-    {{
-      "action": "ACTION_TYPE",
-      "item": "English Name",
-      "qty": 0.0,
-      "unit": "kg/pcs",
-      "voice_response": "Short Urdu response"
-    }}
-    """
-    
+# -------------------------------------------------------------------------
+# 2. AI BILL SCANNER
+# -------------------------------------------------------------------------
+@app.post("/stock/scan-bill")
+async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
-        # Call Gemini 3.5 Flash reasoning
-        response = client.models.generate_content(
-            model="gemini-3.5-flash", 
-            contents=prompt,
-            config={
-                # 3.5 Flash supports native JSON output, 
-                # which stops the AI from adding markdown or extra text.
-                'response_mime_type': 'application/json',
-            }
-        )
+        request_object_content = await file.read()
+        image = PIL.Image.open(io.BytesIO(request_object_content))
+
+        prompt = """
+        Analyze this bill. Return a JSON list of objects.
+        Required keys: "name", "qty", "unit", "price".
+        Format: [{"name": "Item", "qty": 1.0, "unit": "pcs", "price": 0.0}]
+        """
+
+        response_text = ""
         
-        # Clean AI response (handle cases where AI adds markdown)
-        raw_text = response.text
-        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-        
-        if match:
-            intent = json.loads(response.text)
-        else:
-            raise ValueError("AI response did not contain valid JSON")
-
-        action = intent.get("action")
-        item_name = intent.get("item", "").strip()
-        qty = float(intent.get("qty", 0.0))
-
-        # --- DATABASE LOGIC ---
-        
-        # Case 1: QUERY (Check Stock)
-        if action == "QUERY":
-            item = db.query(models.Item).filter(models.Item.name.ilike(item_name)).first()
-            if item:
-                intent["voice_response"] = f"{item.name} ka stock {item.quantity} {item.unit} bacha hai."
-            else:
-                intent["voice_response"] = f"Maaf kijie, {item_name} record mein nahi mila."
-
-        # Case 2: STOCK UPDATES
-        elif action in ["STOCK_IN", "STOCK_OUT"]:
-            item = db.query(models.Item).filter(models.Item.name.ilike(item_name)).first()
-            
-            if not item and action == "STOCK_IN":
-                item = models.Item(name=item_name, quantity=0.0, unit=intent.get("unit", "kg"))
-                db.add(item)
-                db.flush()
-
-            if item:
-                if action == "STOCK_IN":
-                    item.quantity += qty
-                else:
-                    item.quantity -= qty
-                
-                # Record the transaction
-                new_tx = models.StockTransaction(
-                    item_id=item.id,
-                    type=action.lower().replace("stock_", ""),
-                    quantity=qty
+        # RETRY LOOP WITH THE CORRECT MODEL NAME
+        for attempt in range(3):
+            try:
+                print(f"--- AI Scan Attempt {attempt + 1} using {MODEL_NAME} ---")
+                response = client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=[prompt, image],
+                    config={'response_mime_type': 'application/json'}
                 )
-                db.add(new_tx)
-                db.commit()
-            else:
-                intent["voice_response"] = f"Pehle {item_name} ko add karein."
+                if response and response.text:
+                    response_text = clean_json_response(response.text)
+                    print(f"🎯 AI Success!")
+                    break 
+            except Exception as e:
+                err_msg = str(e)
+                if "503" in err_msg or "429" in err_msg:
+                    wait_time = (attempt + 1) * 2
+                    print(f"⚠️ Google Busy. Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    print(f"❌ AI Error: {err_msg}")
+                    raise e
 
-        # Case 3: SUMMARY
-        elif action == "SUMMARY":
-            today = datetime.date.today()
-            sales = db.query(models.StockTransaction).filter(
-                models.StockTransaction.type == 'out',
-                models.StockTransaction.timestamp >= today
-            ).all()
-            total = sum(s.quantity for s in sales)
-            intent["voice_response"] = f"Aaj ki total sale {total} units hai."
+        if not response_text:
+            raise HTTPException(status_code=503, detail="AI response empty.")
 
-        return intent
+        items_from_bill = json.loads(response_text)
+        results_summary = []
+        items_for_flutter = []
+
+        for entry in items_from_bill:
+            item_name = entry.get("name", "Unknown").strip()
+            qty = float(entry.get("qty", 0.0))
+            unit = entry.get("unit", "pcs")
+            price = float(entry.get("price", 0.0))
+
+            db_item = db.query(models.Item).filter(models.Item.name.ilike(item_name)).first()
+            if not db_item:
+                db_item = models.Item(name=item_name, quantity=0.0, unit=unit)
+                if hasattr(db_item, 'sale_price'): db_item.sale_price = price
+                db.add(db_item)
+                db.flush() 
+
+            db_item.quantity += qty
+            db.add(models.StockTransaction(item_id=db_item.id, type="in", quantity=qty))
+            
+            results_summary.append(f"Added {qty} {unit} of {item_name}")
+            items_for_flutter.append({"name": item_name, "qty": qty, "unit": unit, "price": price})
+
+        db.commit()
+        return {"status": "success", "added_items": results_summary, "items_data": items_for_flutter}
 
     except Exception as e:
         db.rollback()
-        print(f"❌ ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"AI/DB Error: {str(e)}")
+        print(f"❌ SCAN FAILED: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-def status():
-    return {"status": "ok", "api_key_loaded": api_key is not None}
+@app.get("/inventory")
+def get_inventory(db: Session = Depends(get_db)):
+    items = db.query(models.Item).all()
+    return [{
+        "id": i.id, "name": i.name, "quantity": float(i.quantity), 
+        "unit": i.unit, "price": float(getattr(i, 'sale_price', 0.0))
+    } for i in items]
