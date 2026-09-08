@@ -1,3 +1,5 @@
+[project]
+name = "awaz-khata-ai-backend"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -14,10 +16,6 @@ dependencies = [
     "sqlalchemy>=2.0.52",
     "uvicorn>=0.52.4",
 ]
-
-[project.scripts]
-awaz-khata-ai-backend = "awaz_khata_ai_backend:main"
-
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]
 build-backend = "uv_build"
