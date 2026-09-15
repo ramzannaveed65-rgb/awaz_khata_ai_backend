@@ -8,7 +8,7 @@ import logging
 import traceback
 from dotenv import load_dotenv
 from google import genai
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Query
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -26,26 +26,34 @@ log = logging.getLogger("awazkhata")
 
 Base.metadata.create_all(bind=engine)
 
+# Pakistan Standard Time. Timestamps are stored in UTC, but "today's sale"
+# must mean a Pakistani calendar day, not a UTC one — otherwise every sale
+# made after 7pm local lands in the next day's report.
+PKT = datetime.timezone(datetime.timedelta(hours=5))
+
+
+def _add_column_if_missing(inspector, table, column, ddl_type):
+    """create_all() makes missing TABLES but never adds a column to a table
+    that already exists. This fills that gap. Safe to run on every boot."""
+    if not inspector.has_table(table):
+        return
+    existing = {c["name"] for c in inspector.get_columns(table)}
+    if column in existing:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(
+            f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
+    log.info("schema: added %s.%s", table, column)
+
 
 def ensure_schema():
-    """
-    create_all() creates missing TABLES but never adds a column to a table
-    that already exists. Since items.sale_price was added after the table
-    was first created, existing databases need the column added by hand.
-
-    This runs once at startup, does nothing if the column is already there,
-    and works on both SQLite and Postgres.
-    """
     inspector = inspect(engine)
-    if not inspector.has_table("items"):
-        return  # create_all will have made it with the column already
-
-    columns = {c["name"] for c in inspector.get_columns("items")}
-    if "sale_price" not in columns:
-        with engine.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE items ADD COLUMN sale_price FLOAT DEFAULT 0.0"))
-        log.info("schema: added items.sale_price")
+    _add_column_if_missing(inspector, "items", "sale_price", "FLOAT DEFAULT 0.0")
+    _add_column_if_missing(inspector, "items", "cost_price", "FLOAT DEFAULT 0.0")
+    _add_column_if_missing(inspector, "transactions", "unit_price",
+                           "FLOAT DEFAULT 0.0")
+    _add_column_if_missing(inspector, "transactions", "total_amount",
+                           "FLOAT DEFAULT 0.0")
 
 
 ensure_schema()
@@ -57,13 +65,10 @@ client = genai.Client(api_key=api_key)
 
 MODEL_NAME = "models/gemini-3.5-flash-lite"
 
-# Largest edge (in pixels) sent to Gemini. Phone photos are typically
-# 3000px+, which costs upload time and tokens for no accuracy gain on bills.
 MAX_IMAGE_EDGE = 1600
 
-# Retry tuning for "Google Busy" (503) and rate-limit (429) responses.
 AI_ATTEMPTS = 4
-AI_BACKOFF = [2, 4, 8]  # seconds between attempts
+AI_BACKOFF = [2, 4, 8]
 
 BUSY_MARKERS = ("503", "429", "overload", "unavailable", "quota",
                 "rate limit", "resource_exhausted")
@@ -75,14 +80,25 @@ class VoiceInput(BaseModel):
     actions: list | None = None
 
 
+# -------------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------------
+def pkt_day_bounds(day=None):
+    """Start and end of a Pakistani calendar day, as naive UTC datetimes
+    matching how timestamps are stored."""
+    if day is None:
+        day = datetime.datetime.now(PKT).date()
+    start_local = datetime.datetime.combine(day, datetime.time.min, tzinfo=PKT)
+    end_local = start_local + datetime.timedelta(days=1)
+    to_utc = lambda d: d.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return to_utc(start_local), to_utc(end_local), day
+
+
 def clean_json_response(text_in):
-    """Strips markdown and ensures clean JSON parsing."""
-    cleaned = re.sub(r'```json|```', '', text_in).strip()
-    return cleaned
+    return re.sub(r'```json|```', '', text_in).strip()
 
 
 def normalize_actions(parsed):
-    """Gemini may return one object or a list. Always return a list."""
     if isinstance(parsed, list):
         return parsed
     if isinstance(parsed, dict):
@@ -92,22 +108,28 @@ def normalize_actions(parsed):
     return []
 
 
+def to_float(value, default=0.0):
+    """Gemini sometimes returns '1,450' or 'Rs 185' instead of a number."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r'[^0-9.\-]', '', str(value))
+    try:
+        return float(cleaned) if cleaned else default
+    except ValueError:
+        return default
+
+
 def _is_busy_error(err):
     msg = str(err).lower()
     return any(marker in msg for marker in BUSY_MARKERS)
 
 
 async def ai_generate(contents, label="ai"):
-    """
-    Single place where Gemini is called.
-
-    1. Runs the SDK call in a worker thread. client.models.generate_content
-       is synchronous — calling it directly inside `async def` blocks the
-       whole event loop, so every other request stalls until Gemini answers.
-
-    2. Never returns an empty string. If every attempt fails or comes back
-       blank it raises 503, so callers can never hand "" to json.loads().
-    """
+    """Single place where Gemini is called. Runs the synchronous SDK call in
+    a worker thread so it does not block the event loop, retries on busy
+    errors, and never returns an empty string."""
     last_error = None
 
     for attempt in range(AI_ATTEMPTS):
@@ -127,8 +149,6 @@ async def ai_generate(contents, label="ai"):
 
         except Exception as e:
             if not _is_busy_error(e):
-                # A real bug (bad API key, malformed request). Surface it
-                # immediately instead of burning retries on it.
                 raise
             last_error = str(e)
             log.warning("%s: Google busy, attempt %s/%s",
@@ -146,7 +166,6 @@ async def ai_generate(contents, label="ai"):
 
 
 def parse_ai_json(text_in, label="ai"):
-    """Parse model output, logging the raw text when it is not valid JSON."""
     try:
         return json.loads(text_in)
     except json.JSONDecodeError:
@@ -158,31 +177,13 @@ def parse_ai_json(text_in, label="ai"):
 
 
 def prepare_image(raw_bytes):
-    """Decode, flatten and downscale the uploaded bill before sending it."""
     image = PIL.Image.open(io.BytesIO(raw_bytes))
-
-    # Strip alpha / palette so JPEG-style encoding downstream is safe.
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
-
     if max(image.size) > MAX_IMAGE_EDGE:
         image.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE),
                         PIL.Image.Resampling.LANCZOS)
-
     return image
-
-
-def to_float(value, default=0.0):
-    """Gemini sometimes returns '1,450' or 'Rs 185' instead of a number."""
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return float(value)
-    cleaned = re.sub(r'[^0-9.\-]', '', str(value))
-    try:
-        return float(cleaned) if cleaned else default
-    except ValueError:
-        return default
 
 
 @app.get("/")
@@ -192,12 +193,11 @@ def home():
 
 @app.get("/health")
 def health():
-    """Cheap endpoint the Flutter app can ping on launch to warm the server."""
     return {"ok": True}
 
 
 # -------------------------------------------------------------------------
-# 2. AI BILL SCANNER (Image Processing)
+# 2. AI BILL SCANNER — purchases (stock IN)
 # -------------------------------------------------------------------------
 @app.post("/stock/scan-bill")
 async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -231,8 +231,7 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
             raise HTTPException(
                 status_code=422,
                 detail="No items could be read from this bill. "
-                       "Try a clearer photo.",
-            )
+                       "Try a clearer photo.")
 
         results_summary = []
         items_for_flutter = []
@@ -255,29 +254,36 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
                 db.add(db_item)
                 db.flush()
 
-            # Update the price on EVERY scan, not only when the item is new.
-            # A zero means Gemini could not read it — keep the old price
-            # rather than wiping a good value.
+            # A purchase bill shows what the shopkeeper PAID — that is
+            # cost_price. Selling price is set separately.
             if price > 0:
-                db_item.sale_price = price
+                db_item.cost_price = price
+                # First time we see this item there is no sale price yet,
+                # so seed it from cost. The shopkeeper can change it later.
+                if not db_item.sale_price:
+                    db_item.sale_price = price
 
             db_item.quantity += qty
             db.add(models.StockTransaction(
-                item_id=db_item.id, type="in", quantity=qty))
+                item_id=db_item.id,
+                type="in",
+                quantity=qty,
+                unit_price=price,
+                total_amount=round(qty * price, 2),
+            ))
 
             results_summary.append(f"Added {qty} {unit} of {item_name}")
             items_for_flutter.append({
                 "name": item_name,
                 "qty": qty,
                 "unit": unit,
-                "price": float(db_item.sale_price or 0.0),
+                "price": float(db_item.cost_price or 0.0),
             })
 
         if not items_for_flutter:
             raise HTTPException(
                 status_code=422,
-                detail="No usable items were read from this bill.",
-            )
+                detail="No usable items were read from this bill.")
 
         db.commit()
         return {
@@ -287,8 +293,6 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
         }
 
     except HTTPException:
-        # Let 503 / 502 / 422 through with their real status code instead of
-        # flattening everything into a 500.
         db.rollback()
         raise
     except Exception as e:
@@ -299,15 +303,13 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
 
 
 # -------------------------------------------------------------------------
-# 3. MAIN VOICE PROCESSOR — parse (no writes) then confirm (writes)
+# 3. MAIN VOICE PROCESSOR
 # -------------------------------------------------------------------------
 @app.post("/voice/process")
 async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
-    # ---------- PHASE 2: user confirmed → write to DB ----------
     if data.confirm:
         return execute_actions(data.actions or [], db)
 
-    # ---------- PHASE 1: parse only, never writes ----------
     prompt = f"""
     You are AwazKhata AI. Convert this command into JSON: "{data.transcript}"
 
@@ -316,6 +318,9 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
     Example: "5 kilo cheeni add kro aur 5 kilo namak add kro" = TWO commands.
     Return one JSON object per command.
 
+    If the user states a price ("200 rupay kilo", "150 ka becha"), put the
+    PER-UNIT price in "price". If no price is mentioned, use 0.
+
     Translation Mapping:
     - Namak -> Salt, Chini/Shakar -> Sugar, Pani -> Water, Dudh -> Milk, Atta -> Flour.
 
@@ -323,7 +328,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
     - 'kitna hai', 'bachi hai', 'stock dikhao' -> "QUERY"
     - 'add karo', 'le aya', 'khareeda' -> "STOCK_IN"
     - 'becha', 'bech di', 'sell', 'nikal do' -> "STOCK_OUT"
-    - 'aaj ki sale' -> "SUMMARY"
+    - 'aaj ki sale', 'aaj ka hisab' -> "SUMMARY"
 
     Return ONLY a JSON ARRAY, even when there is just one command:
     [
@@ -332,6 +337,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
         "item": "Standard English Name",
         "qty": 0.0,
         "unit": "kg / pcs / pack",
+        "price": 0.0,
         "voice_response": "Natural Urdu response"
       }}
     ]
@@ -342,7 +348,8 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
     try:
         actions = normalize_actions(parse_ai_json(response_text, label="voice"))
         if not actions:
-            raise HTTPException(status_code=422, detail="Could not understand command")
+            raise HTTPException(status_code=422,
+                                detail="Could not understand command")
 
         for a in actions:
             action = a.get("action")
@@ -359,14 +366,20 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                 )
 
             elif action == "SUMMARY":
-                today = datetime.datetime.combine(
-                    datetime.date.today(), datetime.time.min)
+                start, end, day = pkt_day_bounds()
                 sales = db.query(models.StockTransaction).filter(
                     models.StockTransaction.type == 'out',
-                    models.StockTransaction.timestamp >= today
+                    models.StockTransaction.timestamp >= start,
+                    models.StockTransaction.timestamp < end,
                 ).all()
-                total = sum(s.quantity for s in sales)
-                a["voice_response"] = f"Aaj ki total sale {total} units hai."
+                revenue = sum(s.total_amount or 0.0 for s in sales)
+                a["total_sale"] = round(revenue, 2)
+                a["bill_count"] = len(sales)
+                a["voice_response"] = (
+                    f"Aaj ki total sale {revenue:,.0f} rupay hai, "
+                    f"{len(sales)} items bikay."
+                    if sales else "Aaj abhi tak koi sale nahi hui."
+                )
 
             elif action == "STOCK_OUT":
                 db_item = db.query(models.Item).filter(
@@ -375,12 +388,16 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                     a["warning"] = f"{item_name} stock mein nahi hai."
                 elif db_item.quantity < qty:
                     a["warning"] = (
-                        f"Sirf {db_item.quantity} {db_item.unit} {item_name} bacha hai."
-                    )
+                        f"Sirf {db_item.quantity} {db_item.unit} {item_name} bacha hai.")
+                else:
+                    # Show the shopkeeper what this sale will come to
+                    # BEFORE they confirm it.
+                    rate = to_float(a.get("price")) or float(db_item.sale_price or 0.0)
+                    a["unit_price"] = rate
+                    a["line_total"] = round(qty * rate, 2)
 
         needs_confirm = any(
-            a.get("action") in ("STOCK_IN", "STOCK_OUT") for a in actions
-        )
+            a.get("action") in ("STOCK_IN", "STOCK_OUT") for a in actions)
         return {"actions": actions, "needs_confirm": needs_confirm}
 
     except HTTPException:
@@ -389,12 +406,14 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
         db.rollback()
         log.error("VOICE LOGIC ERROR: %s", e)
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to process voice intent")
+        raise HTTPException(status_code=500,
+                            detail="Failed to process voice intent")
 
 
 def execute_actions(actions, db):
     """Commits confirmed STOCK_IN / STOCK_OUT actions. All-or-nothing."""
     results = []
+    sale_total = 0.0
     try:
         for a in actions:
             action = a.get("action")
@@ -417,28 +436,44 @@ def execute_actions(actions, db):
                 db.add(db_item)
                 db.flush()
 
-            # A voice command may carry a price ("200 rupay kilo").
-            voice_price = to_float(a.get("price"))
-            if voice_price > 0:
-                db_item.sale_price = voice_price
+            spoken_price = to_float(a.get("price"))
 
             if action == "STOCK_IN":
+                rate = spoken_price or float(db_item.cost_price or 0.0)
+                if spoken_price > 0:
+                    db_item.cost_price = spoken_price
                 db_item.quantity += qty
             else:
                 if db_item.quantity < qty:
                     raise ValueError(
                         f"Sirf {db_item.quantity} {db_item.unit} {item_name} bacha hai")
+                # Sale price: what was spoken, else the item's standing price.
+                rate = spoken_price or float(db_item.sale_price or 0.0)
+                if spoken_price > 0:
+                    db_item.sale_price = spoken_price
                 db_item.quantity -= qty
+                sale_total += qty * rate
+
+            line_total = round(qty * rate, 2)
 
             db.add(models.StockTransaction(
                 item_id=db_item.id,
                 type=action.lower().replace("stock_", ""),
                 quantity=qty,
+                unit_price=rate,
+                total_amount=line_total,
             ))
-            results.append(f"{item_name}: {db_item.quantity} {db_item.unit}")
+            results.append(
+                f"{item_name}: {db_item.quantity} {db_item.unit}"
+                + (f" (Rs {line_total:,.0f})" if action == "STOCK_OUT" else "")
+            )
 
         db.commit()
-        return {"status": "success", "results": results}
+        return {
+            "status": "success",
+            "results": results,
+            "sale_total": round(sale_total, 2),
+        }
 
     except Exception as e:
         db.rollback()
@@ -448,7 +483,113 @@ def execute_actions(actions, db):
 
 
 # -------------------------------------------------------------------------
-# 4. UTILITY ENDPOINTS
+# 4. REPORTS
+# -------------------------------------------------------------------------
+@app.get("/reports/daily")
+def daily_report(
+    date: str | None = Query(None, description="YYYY-MM-DD, defaults to today"),
+    db: Session = Depends(get_db),
+):
+    """Day-end sales record: what sold, at what price, and the day's total."""
+    try:
+        day = None
+        if date:
+            try:
+                day = datetime.datetime.strptime(date, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(status_code=400,
+                                    detail="date must be YYYY-MM-DD")
+
+        start, end, day = pkt_day_bounds(day)
+
+        rows = (
+            db.query(models.StockTransaction, models.Item)
+            .join(models.Item, models.Item.id == models.StockTransaction.item_id)
+            .filter(models.StockTransaction.timestamp >= start,
+                    models.StockTransaction.timestamp < end)
+            .order_by(models.StockTransaction.timestamp)
+            .all()
+        )
+
+        sales, purchases = [], []
+        revenue = cost = 0.0
+
+        for txn, item in rows:
+            amount = float(txn.total_amount or 0.0)
+            record = {
+                "time": (txn.timestamp.replace(tzinfo=datetime.timezone.utc)
+                         .astimezone(PKT).strftime("%H:%M")),
+                "item": item.name,
+                "qty": float(txn.quantity or 0.0),
+                "unit": item.unit,
+                "unit_price": float(txn.unit_price or 0.0),
+                "amount": amount,
+            }
+            if txn.type == "out":
+                sales.append(record)
+                revenue += amount
+            else:
+                purchases.append(record)
+                cost += amount
+
+        # Per-item roll-up so the shopkeeper sees what moved, not 40 lines.
+        by_item = {}
+        for s in sales:
+            b = by_item.setdefault(
+                s["item"], {"item": s["item"], "unit": s["unit"],
+                            "qty": 0.0, "amount": 0.0})
+            b["qty"] += s["qty"]
+            b["amount"] += s["amount"]
+
+        return {
+            "date": day.isoformat(),
+            "total_sale": round(revenue, 2),
+            "total_purchase": round(cost, 2),
+            "sale_count": len(sales),
+            "items_sold": sorted(by_item.values(),
+                                 key=lambda x: x["amount"], reverse=True),
+            "sales": sales,
+            "purchases": purchases,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("DAILY REPORT ERROR: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to build report")
+
+
+@app.get("/reports/range")
+def range_report(
+    days: int = Query(7, ge=1, le=90, description="How many days back"),
+    db: Session = Depends(get_db),
+):
+    """Sale totals per day, newest first. For a weekly/monthly chart."""
+    try:
+        today = datetime.datetime.now(PKT).date()
+        out = []
+        for i in range(days):
+            day = today - datetime.timedelta(days=i)
+            start, end, _ = pkt_day_bounds(day)
+            rows = db.query(models.StockTransaction).filter(
+                models.StockTransaction.type == 'out',
+                models.StockTransaction.timestamp >= start,
+                models.StockTransaction.timestamp < end,
+            ).all()
+            out.append({
+                "date": day.isoformat(),
+                "total_sale": round(sum(r.total_amount or 0.0 for r in rows), 2),
+                "sale_count": len(rows),
+            })
+        return {"days": days, "report": out}
+    except Exception as e:
+        log.error("RANGE REPORT ERROR: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to build report")
+
+
+# -------------------------------------------------------------------------
+# 5. UTILITY ENDPOINTS
 # -------------------------------------------------------------------------
 @app.get("/inventory")
 def get_inventory(db: Session = Depends(get_db)):
@@ -461,7 +602,28 @@ def get_inventory(db: Session = Depends(get_db)):
             "unit": i.unit,
             "min_stock": float(i.min_stock or 0.0),
             "price": float(i.sale_price or 0.0),
+            "cost_price": float(i.cost_price or 0.0),
         } for i in items]
     except Exception as e:
         log.error("INVENTORY ERROR: %s", e)
         return []
+
+
+class PriceUpdate(BaseModel):
+    sale_price: float
+
+
+@app.put("/items/{item_id}/price")
+def set_sale_price(item_id: int, body: PriceUpdate,
+                   db: Session = Depends(get_db)):
+    """Lets the shopkeeper set a selling price that differs from what the
+    purchase bill said. Without this, every sale records at cost."""
+    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if body.sale_price < 0:
+        raise HTTPException(status_code=400, detail="Price cannot be negative")
+    item.sale_price = body.sale_price
+    db.commit()
+    return {"status": "success", "id": item.id, "name": item.name,
+            "sale_price": float(item.sale_price)}
