@@ -4,6 +4,7 @@ import datetime
 import io
 import asyncio
 import re
+import logging
 import traceback
 from dotenv import load_dotenv
 from google import genai
@@ -21,10 +22,24 @@ load_dotenv()
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="AwazKhata AI Backend 2026")
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("awazkhata")
+
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
 MODEL_NAME = "models/gemini-3.5-flash"
+
+# Largest edge (in pixels) sent to Gemini. Phone photos are typically
+# 3000px+, which costs upload time and tokens for no accuracy gain on bills.
+MAX_IMAGE_EDGE = 1600
+
+# Retry tuning for "Google Busy" (503) and rate-limit (429) responses.
+AI_ATTEMPTS = 4
+AI_BACKOFF = [2, 4, 8]  # seconds between attempts
+
+BUSY_MARKERS = ("503", "429", "overload", "unavailable", "quota",
+                "rate limit", "resource_exhausted")
 
 
 class VoiceInput(BaseModel):
@@ -50,9 +65,98 @@ def normalize_actions(parsed):
     return []
 
 
+def _is_busy_error(err):
+    msg = str(err).lower()
+    return any(marker in msg for marker in BUSY_MARKERS)
+
+
+async def ai_generate(contents, label="ai"):
+    """
+    Single place where Gemini is called.
+
+    Two things this does that the old inline loops did not:
+
+    1. Runs the SDK call in a worker thread. client.models.generate_content
+       is synchronous — calling it directly inside `async def` blocks the
+       whole event loop, so every other request (inventory polls, a second
+       voice command) stalls until Gemini answers.
+
+    2. Never returns an empty string. If every attempt fails or comes back
+       blank it raises 503, so callers can never hand "" to json.loads().
+    """
+    last_error = None
+
+    for attempt in range(AI_ATTEMPTS):
+        try:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=MODEL_NAME,
+                contents=contents,
+                config={'response_mime_type': 'application/json'},
+            )
+            if response and response.text and response.text.strip():
+                return clean_json_response(response.text)
+
+            last_error = "empty response"
+            log.warning("%s: empty model response (attempt %s/%s)",
+                        label, attempt + 1, AI_ATTEMPTS)
+
+        except Exception as e:
+            if not _is_busy_error(e):
+                # A real bug (bad API key, malformed request). Surface it
+                # immediately instead of burning retries on it.
+                raise
+            last_error = str(e)
+            log.warning("%s: Google busy, attempt %s/%s",
+                        label, attempt + 1, AI_ATTEMPTS)
+
+        if attempt < AI_ATTEMPTS - 1:
+            await asyncio.sleep(AI_BACKOFF[attempt])
+
+    log.error("%s: all %s attempts failed. Last: %s",
+              label, AI_ATTEMPTS, last_error)
+    raise HTTPException(
+        status_code=503,
+        detail="AI service is busy right now. Please try again in a moment.",
+    )
+
+
+def parse_ai_json(text, label="ai"):
+    """Parse model output, logging the raw text when it is not valid JSON."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        log.error("%s: model returned non-JSON: %r", label, text[:500])
+        raise HTTPException(
+            status_code=502,
+            detail="AI returned an unreadable response. Please try again.",
+        )
+
+
+def prepare_image(raw_bytes):
+    """Decode, flatten and downscale the uploaded bill before sending it."""
+    image = PIL.Image.open(io.BytesIO(raw_bytes))
+
+    # Strip alpha / palette so JPEG-style encoding downstream is safe.
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+
+    if max(image.size) > MAX_IMAGE_EDGE:
+        image.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE),
+                        PIL.Image.Resampling.LANCZOS)
+
+    return image
+
+
 @app.get("/")
 def home():
     return {"status": "Online", "message": "AwazKhata API is active"}
+
+
+@app.get("/health")
+def health():
+    """Cheap endpoint the Flutter app can ping on launch to warm the server."""
+    return {"ok": True}
 
 
 # -------------------------------------------------------------------------
@@ -62,7 +166,7 @@ def home():
 async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
         request_object_content = await file.read()
-        image = PIL.Image.open(io.BytesIO(request_object_content))
+        image = prepare_image(request_object_content)
 
         prompt = """
         Analyze this bill. Return a JSON list of products.
@@ -71,24 +175,17 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
         Format: [{"name": "Item", "qty": 1.0, "unit": "pcs", "price": 0.0}]
         """
 
-        response_text = ""
-        for attempt in range(3):
-            try:
-                response = client.models.generate_content(
-                    model=MODEL_NAME,
-                    contents=[prompt, image],
-                    config={'response_mime_type': 'application/json'}
-                )
-                if response and response.text:
-                    response_text = clean_json_response(response.text)
-                    break
-            except Exception as e:
-                if "503" in str(e) or "429" in str(e):
-                    await asyncio.sleep(2 * (attempt + 1))
-                    continue
-                raise e
+        response_text = await ai_generate([prompt, image], label="scan-bill")
+        items_from_bill = normalize_actions(
+            parse_ai_json(response_text, label="scan-bill"))
 
-        items_from_bill = normalize_actions(json.loads(response_text))
+        if not items_from_bill:
+            raise HTTPException(
+                status_code=422,
+                detail="No items could be read from this bill. "
+                       "Try a clearer photo.",
+            )
+
         results_summary = []
         items_for_flutter = []
 
@@ -121,9 +218,15 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
             "added_items": results_summary,
             "items_data": items_for_flutter,
         }
+
+    except HTTPException:
+        # Let 503 / 502 / 422 through with their real status code instead of
+        # flattening everything into a 500.
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
-        print(f"❌ SCAN ERROR: {str(e)}")
+        log.error("SCAN ERROR: %s", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -167,29 +270,10 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
     ]
     """
 
-    response_text = ""
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config={'response_mime_type': 'application/json'}
-            )
-            if response and response.text:
-                response_text = clean_json_response(response.text)
-                break
-        except Exception as e:
-            if "503" in str(e) or "429" in str(e):
-                print(f"⚠️ Google Busy. Retrying voice in {attempt+2}s...")
-                await asyncio.sleep(attempt + 2)
-                continue
-            raise e
-
-    if not response_text:
-        raise HTTPException(status_code=503, detail="AI is temporarily unavailable")
+    response_text = await ai_generate(prompt, label="voice")
 
     try:
-        actions = normalize_actions(json.loads(response_text))
+        actions = normalize_actions(parse_ai_json(response_text, label="voice"))
         if not actions:
             raise HTTPException(status_code=422, detail="Could not understand command")
 
@@ -208,7 +292,8 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                 )
 
             elif action == "SUMMARY":
-                today = datetime.date.today()
+                today = datetime.datetime.combine(
+                    datetime.date.today(), datetime.time.min)
                 sales = db.query(models.StockTransaction).filter(
                     models.StockTransaction.type == 'out',
                     models.StockTransaction.timestamp >= today
@@ -235,7 +320,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         db.rollback()
-        print(f"❌ VOICE LOGIC ERROR: {str(e)}")
+        log.error("VOICE LOGIC ERROR: %s", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to process voice intent")
 
@@ -285,7 +370,7 @@ def execute_actions(actions, db):
 
     except Exception as e:
         db.rollback()
-        print(f"❌ EXECUTE ERROR: {e}")
+        log.error("EXECUTE ERROR: %s", e)
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -305,5 +390,5 @@ def get_inventory(db: Session = Depends(get_db)):
             "price": float(getattr(i, 'sale_price', 0.0))
         } for i in items]
     except Exception as e:
-        print(f"❌ INVENTORY ERROR: {e}")
+        log.error("INVENTORY ERROR: %s", e)
         return []
