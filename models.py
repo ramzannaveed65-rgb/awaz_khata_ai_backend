@@ -9,6 +9,7 @@ class Item(Base):
     quantity = Column(Float, default=0.0)
     unit = Column(String, default="kg")
     min_stock = Column(Float, default=5.0)
+    sale_price = Column(Float, default=0.0)
 
 class StockTransaction(Base):
     __tablename__ = "transactions"

@@ -9,6 +9,7 @@ import traceback
 from dotenv import load_dotenv
 from google import genai
 from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import PIL.Image
@@ -19,11 +20,37 @@ from database import engine, get_db, Base
 
 # 1. INITIALIZATION
 load_dotenv()
-Base.metadata.create_all(bind=engine)
-app = FastAPI(title="AwazKhata AI Backend 2026")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("awazkhata")
+
+Base.metadata.create_all(bind=engine)
+
+
+def ensure_schema():
+    """
+    create_all() creates missing TABLES but never adds a column to a table
+    that already exists. Since items.sale_price was added after the table
+    was first created, existing databases need the column added by hand.
+
+    This runs once at startup, does nothing if the column is already there,
+    and works on both SQLite and Postgres.
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table("items"):
+        return  # create_all will have made it with the column already
+
+    columns = {c["name"] for c in inspector.get_columns("items")}
+    if "sale_price" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE items ADD COLUMN sale_price FLOAT DEFAULT 0.0"))
+        log.info("schema: added items.sale_price")
+
+
+ensure_schema()
+
+app = FastAPI(title="AwazKhata AI Backend 2026")
 
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
@@ -48,9 +75,9 @@ class VoiceInput(BaseModel):
     actions: list | None = None
 
 
-def clean_json_response(text):
+def clean_json_response(text_in):
     """Strips markdown and ensures clean JSON parsing."""
-    cleaned = re.sub(r'```json|```', '', text).strip()
+    cleaned = re.sub(r'```json|```', '', text_in).strip()
     return cleaned
 
 
@@ -74,12 +101,9 @@ async def ai_generate(contents, label="ai"):
     """
     Single place where Gemini is called.
 
-    Two things this does that the old inline loops did not:
-
     1. Runs the SDK call in a worker thread. client.models.generate_content
        is synchronous — calling it directly inside `async def` blocks the
-       whole event loop, so every other request (inventory polls, a second
-       voice command) stalls until Gemini answers.
+       whole event loop, so every other request stalls until Gemini answers.
 
     2. Never returns an empty string. If every attempt fails or comes back
        blank it raises 503, so callers can never hand "" to json.loads().
@@ -121,12 +145,12 @@ async def ai_generate(contents, label="ai"):
     )
 
 
-def parse_ai_json(text, label="ai"):
+def parse_ai_json(text_in, label="ai"):
     """Parse model output, logging the raw text when it is not valid JSON."""
     try:
-        return json.loads(text)
+        return json.loads(text_in)
     except json.JSONDecodeError:
-        log.error("%s: model returned non-JSON: %r", label, text[:500])
+        log.error("%s: model returned non-JSON: %r", label, text_in[:500])
         raise HTTPException(
             status_code=502,
             detail="AI returned an unreadable response. Please try again.",
@@ -146,6 +170,19 @@ def prepare_image(raw_bytes):
                         PIL.Image.Resampling.LANCZOS)
 
     return image
+
+
+def to_float(value, default=0.0):
+    """Gemini sometimes returns '1,450' or 'Rs 185' instead of a number."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r'[^0-9.\-]', '', str(value))
+    try:
+        return float(cleaned) if cleaned else default
+    except ValueError:
+        return default
 
 
 @app.get("/")
@@ -171,7 +208,18 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
         prompt = """
         Analyze this bill. Return a JSON list of products.
         Required keys: "name", "qty", "unit", "price".
-        Note: Translate names to English (e.g., Namak to Salt).
+
+        "price" MUST be the PER-UNIT RATE, never the line total.
+        Example: a row reading "Sugar | 5 kg | 185 | 925" means
+        qty=5, unit="kg", price=185 (NOT 925).
+        If the bill shows only a total for the line, divide it by the
+        quantity to get the per-unit rate.
+
+        Return numbers as plain numbers: 1450, not "1,450" or "Rs 1450".
+        Ignore any TOTAL, SUBTOTAL, CASH, CHANGE, TAX or DISCOUNT rows —
+        those are not products.
+        Translate names to English (e.g., Namak to Salt, Chini to Sugar).
+
         Format: [{"name": "Item", "qty": 1.0, "unit": "pcs", "price": 0.0}]
         """
 
@@ -190,27 +238,46 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
         items_for_flutter = []
 
         for entry in items_from_bill:
-            item_name = entry.get("name", "Unknown").strip()
-            qty = float(entry.get("qty", 0.0))
-            unit = entry.get("unit", "pcs")
-            price = float(entry.get("price", 0.0))
+            item_name = str(entry.get("name", "Unknown")).strip()
+            qty = to_float(entry.get("qty"))
+            unit = entry.get("unit") or "pcs"
+            price = to_float(entry.get("price"))
+
+            if not item_name or qty <= 0:
+                log.warning("scan-bill: skipping bad row %r", entry)
+                continue
 
             db_item = db.query(models.Item).filter(
                 models.Item.name.ilike(item_name)).first()
+
             if not db_item:
                 db_item = models.Item(name=item_name, quantity=0.0, unit=unit)
-                if hasattr(db_item, 'sale_price'):
-                    db_item.sale_price = price
                 db.add(db_item)
                 db.flush()
+
+            # Update the price on EVERY scan, not only when the item is new.
+            # A zero means Gemini could not read it — keep the old price
+            # rather than wiping a good value.
+            if price > 0:
+                db_item.sale_price = price
 
             db_item.quantity += qty
             db.add(models.StockTransaction(
                 item_id=db_item.id, type="in", quantity=qty))
 
             results_summary.append(f"Added {qty} {unit} of {item_name}")
-            items_for_flutter.append(
-                {"name": item_name, "qty": qty, "unit": unit, "price": price})
+            items_for_flutter.append({
+                "name": item_name,
+                "qty": qty,
+                "unit": unit,
+                "price": float(db_item.sale_price or 0.0),
+            })
+
+        if not items_for_flutter:
+            raise HTTPException(
+                status_code=422,
+                detail="No usable items were read from this bill.",
+            )
 
         db.commit()
         return {
@@ -280,7 +347,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
         for a in actions:
             action = a.get("action")
             item_name = (a.get("item") or "").strip()
-            qty = float(a.get("qty") or 0.0)
+            qty = to_float(a.get("qty"))
 
             if action == "QUERY":
                 db_item = db.query(models.Item).filter(
@@ -335,7 +402,7 @@ def execute_actions(actions, db):
                 continue
 
             item_name = (a.get("item") or "").strip()
-            qty = float(a.get("qty") or 0.0)
+            qty = to_float(a.get("qty"))
             if qty <= 0:
                 raise ValueError(f"Invalid quantity for {item_name}")
 
@@ -349,6 +416,11 @@ def execute_actions(actions, db):
                     name=item_name, quantity=0.0, unit=a.get("unit", "pcs"))
                 db.add(db_item)
                 db.flush()
+
+            # A voice command may carry a price ("200 rupay kilo").
+            voice_price = to_float(a.get("price"))
+            if voice_price > 0:
+                db_item.sale_price = voice_price
 
             if action == "STOCK_IN":
                 db_item.quantity += qty
@@ -387,7 +459,8 @@ def get_inventory(db: Session = Depends(get_db)):
             "name": i.name,
             "quantity": float(i.quantity),
             "unit": i.unit,
-            "price": float(getattr(i, 'sale_price', 0.0))
+            "min_stock": float(i.min_stock or 0.0),
+            "price": float(i.sale_price or 0.0),
         } for i in items]
     except Exception as e:
         log.error("INVENTORY ERROR: %s", e)
