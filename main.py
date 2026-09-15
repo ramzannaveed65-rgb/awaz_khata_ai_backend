@@ -28,7 +28,7 @@ log = logging.getLogger("awazkhata")
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
-MODEL_NAME = "models/gemini-3.5-flash"
+MODEL_NAME = "models/gemini-3.5-flash-lite"
 
 # Largest edge (in pixels) sent to Gemini. Phone photos are typically
 # 3000px+, which costs upload time and tokens for no accuracy gain on bills.
