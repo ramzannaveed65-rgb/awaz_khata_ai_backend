@@ -73,6 +73,10 @@ AI_BACKOFF = [2, 4, 8]
 BUSY_MARKERS = ("503", "429", "overload", "unavailable", "quota",
                 "rate limit", "resource_exhausted")
 
+# A single line on a kiryana bill should never legitimately exceed this.
+# Anything above it means a unit/price mix-up, not a real purchase.
+MAX_SANE_LINE_AMOUNT = 500_000
+
 
 class VoiceInput(BaseModel):
     transcript: str
@@ -186,6 +190,37 @@ def prepare_image(raw_bytes):
     return image
 
 
+def normalize_pack_pricing(item_name, qty, unit, price, line_amount):
+    """
+    Bills price packaged goods by the PACK, not by the gram or millilitre.
+    "Tea Leaves | 950 gm | 1,450 | 1,450" means Rs 1450 for one 950gm pack —
+    NOT Rs 1450 per gram. Multiplying gives Rs 1,377,500, which is how a
+    single tea row came to be 99% of a day's purchases.
+
+    The tell is that RATE and AMOUNT are the same number: that only happens
+    when the quantity being priced is one of something. When we see it, we
+    fold the pack size into the name and store a single pack.
+
+    Returns (qty, unit, price, name).
+    """
+    if qty > 1 and line_amount > 0 and abs(line_amount - price) < 0.01:
+        packed_name = item_name
+        size = f"{qty:g}{unit}".replace(" ", "")
+        if size.lower() not in item_name.lower().replace(" ", ""):
+            packed_name = f"{item_name} {qty:g}{unit}"
+        log.info("scan-bill: %r priced per pack, storing 1 pack at %s",
+                 item_name, price)
+        return 1.0, "pack", price, packed_name
+
+    # Second guard: a per-unit rate that produces an absurd line total.
+    if qty > 1 and price > 0 and qty * price > MAX_SANE_LINE_AMOUNT:
+        log.warning("scan-bill: %r line total %s is implausible, treating "
+                    "the price as a pack price", item_name, qty * price)
+        return 1.0, "pack", price, f"{item_name} {qty:g}{unit}"
+
+    return qty, unit, price, item_name
+
+
 @app.get("/")
 def home():
     return {"status": "Online", "message": "AwazKhata API is active"}
@@ -207,20 +242,28 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
 
         prompt = """
         Analyze this bill. Return a JSON list of products.
-        Required keys: "name", "qty", "unit", "price".
+        Required keys: "name", "qty", "unit", "price", "amount".
 
-        "price" MUST be the PER-UNIT RATE, never the line total.
-        Example: a row reading "Sugar | 5 kg | 185 | 925" means
-        qty=5, unit="kg", price=185 (NOT 925).
-        If the bill shows only a total for the line, divide it by the
-        quantity to get the per-unit rate.
+        "price" is the PER-UNIT RATE column.
+        "amount" is the LINE TOTAL column.
+        If the bill shows only one price column, put the same number in both.
+
+        IMPORTANT — packaged goods:
+        If a row's RATE and AMOUNT are the same number, that price is for
+        ONE WHOLE PACK, not per gram or per millilitre. In that case return
+        qty=1, unit="pack", and put the pack size in the name.
+        Example: "Tea Leaves | 950 gm | 1,450 | 1,450" must become
+        {"name": "Tea Leaves 950gm", "qty": 1, "unit": "pack",
+         "price": 1450, "amount": 1450}
+        NOT qty=950 with price=1450, which would mean Rs 1,377,500.
 
         Return numbers as plain numbers: 1450, not "1,450" or "Rs 1450".
         Ignore any TOTAL, SUBTOTAL, CASH, CHANGE, TAX or DISCOUNT rows —
         those are not products.
         Translate names to English (e.g., Namak to Salt, Chini to Sugar).
 
-        Format: [{"name": "Item", "qty": 1.0, "unit": "pcs", "price": 0.0}]
+        Format: [{"name": "Item", "qty": 1.0, "unit": "pcs",
+                  "price": 0.0, "amount": 0.0}]
         """
 
         response_text = await ai_generate([prompt, image], label="scan-bill")
@@ -241,10 +284,15 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
             qty = to_float(entry.get("qty"))
             unit = entry.get("unit") or "pcs"
             price = to_float(entry.get("price"))
+            line_amount = to_float(entry.get("amount"))
 
             if not item_name or qty <= 0:
                 log.warning("scan-bill: skipping bad row %r", entry)
                 continue
+
+            # Catch pack-priced rows before they multiply out to nonsense.
+            qty, unit, price, item_name = normalize_pack_pricing(
+                item_name, qty, unit, price, line_amount)
 
             db_item = db.query(models.Item).filter(
                 models.Item.name.ilike(item_name)).first()
@@ -272,7 +320,7 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
                 total_amount=round(qty * price, 2),
             ))
 
-            results_summary.append(f"Added {qty} {unit} of {item_name}")
+            results_summary.append(f"Added {qty:g} {unit} of {item_name}")
             items_for_flutter.append({
                 "name": item_name,
                 "qty": qty,
@@ -360,7 +408,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                 db_item = db.query(models.Item).filter(
                     models.Item.name.ilike(item_name)).first()
                 a["voice_response"] = (
-                    f"{db_item.name} ka stock {db_item.quantity} {db_item.unit} bacha hai."
+                    f"{db_item.name} ka stock {db_item.quantity:g} {db_item.unit} bacha hai."
                     if db_item else
                     f"Maaf kijie, {item_name} record mein nahi mila."
                 )
@@ -388,7 +436,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                     a["warning"] = f"{item_name} stock mein nahi hai."
                 elif db_item.quantity < qty:
                     a["warning"] = (
-                        f"Sirf {db_item.quantity} {db_item.unit} {item_name} bacha hai.")
+                        f"Sirf {db_item.quantity:g} {db_item.unit} {item_name} bacha hai.")
                 else:
                     # Show the shopkeeper what this sale will come to
                     # BEFORE they confirm it.
@@ -446,7 +494,7 @@ def execute_actions(actions, db):
             else:
                 if db_item.quantity < qty:
                     raise ValueError(
-                        f"Sirf {db_item.quantity} {db_item.unit} {item_name} bacha hai")
+                        f"Sirf {db_item.quantity:g} {db_item.unit} {item_name} bacha hai")
                 # Sale price: what was spoken, else the item's standing price.
                 rate = spoken_price or float(db_item.sale_price or 0.0)
                 if spoken_price > 0:
@@ -463,10 +511,18 @@ def execute_actions(actions, db):
                 unit_price=rate,
                 total_amount=line_total,
             ))
-            results.append(
-                f"{item_name}: {db_item.quantity} {db_item.unit}"
-                + (f" (Rs {line_total:,.0f})" if action == "STOCK_OUT" else "")
-            )
+
+            # Say what HAPPENED, then what is left. The old wording put the
+            # remaining stock next to the sale amount, which read as though
+            # 1 kg of sugar had sold for Rs 370.
+            if action == "STOCK_OUT":
+                results.append(
+                    f"Sold {qty:g} {db_item.unit} {item_name} — "
+                    f"Rs {line_total:,.0f} ({db_item.quantity:g} {db_item.unit} left)")
+            else:
+                results.append(
+                    f"Added {qty:g} {db_item.unit} {item_name} "
+                    f"({db_item.quantity:g} {db_item.unit} in stock)")
 
         db.commit()
         return {
@@ -627,3 +683,37 @@ def set_sale_price(item_id: int, body: PriceUpdate,
     db.commit()
     return {"status": "success", "id": item.id, "name": item.name,
             "sale_price": float(item.sale_price)}
+
+
+class ItemFix(BaseModel):
+    quantity: float | None = None
+    unit: str | None = None
+    cost_price: float | None = None
+    sale_price: float | None = None
+
+
+@app.put("/items/{item_id}")
+def fix_item(item_id: int, body: ItemFix, db: Session = Depends(get_db)):
+    """Correct an item the scanner got wrong — wrong unit, wrong quantity,
+    wrong price. Needed because a bad scan otherwise stays bad forever."""
+    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    if body.quantity is not None:
+        if body.quantity < 0:
+            raise HTTPException(status_code=400,
+                                detail="Quantity cannot be negative")
+        item.quantity = body.quantity
+    if body.unit:
+        item.unit = body.unit
+    if body.cost_price is not None:
+        item.cost_price = body.cost_price
+    if body.sale_price is not None:
+        item.sale_price = body.sale_price
+
+    db.commit()
+    return {"status": "success", "id": item.id, "name": item.name,
+            "quantity": float(item.quantity), "unit": item.unit,
+            "cost_price": float(item.cost_price or 0.0),
+            "sale_price": float(item.sale_price or 0.0)}
