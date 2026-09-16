@@ -4,6 +4,7 @@ import datetime
 import io
 import asyncio
 import re
+import difflib
 import logging
 import traceback
 from dotenv import load_dotenv
@@ -77,11 +78,103 @@ BUSY_MARKERS = ("503", "429", "overload", "unavailable", "quota",
 # Anything above it means a unit/price mix-up, not a real purchase.
 MAX_SANE_LINE_AMOUNT = 500_000
 
+# How alike two names must be before they are treated as the same product.
+# Higher = stricter. Scans use the stricter value because wrongly merging
+# two products corrupts stock counts permanently.
+FUZZY_CUTOFF_VOICE = 0.82
+FUZZY_CUTOFF_SCAN = 0.90
+
 
 class VoiceInput(BaseModel):
     transcript: str
     confirm: bool = False
     actions: list | None = None
+
+
+# -------------------------------------------------------------------------
+# NAME MATCHING
+# -------------------------------------------------------------------------
+def _norm(s):
+    """Lowercase, strip punctuation, collapse spaces."""
+    s = re.sub(r'[^a-z0-9 ]', ' ', (s or '').lower())
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _squash(s):
+    """Normalised form with doubled letters collapsed and spaces removed.
+
+    This is what catches Chilli vs Chili, Yoghurt vs Yogurt, Dal vs Daal —
+    the spellings Gemini alternates between for the same product.
+    """
+    return re.sub(r'(.)\1+', r'\1', _norm(s).replace(' ', ''))
+
+
+def find_item(db, name, allow_partial=False, cutoff=FUZZY_CUTOFF_VOICE):
+    """
+    Look up an item by name, tolerating the spelling drift that comes from
+    passing product names through a language model.
+
+    Gemini returned "Red Chili Powder" for stock that was saved as
+    "Red Chilli Powder", and an exact ilike found nothing — so a sale of
+    stock that plainly existed failed with "stock mein nahi hai".
+
+    Tried in order, stopping at the first hit:
+      1. exact match (case-insensitive)
+      2. squashed match — handles doubled-letter spellings
+      3. close match by edit distance
+      4. partial match, voice only, and only when the stored name CONTAINS
+         the spoken one ("rice" finding "Basmati Rice")
+
+    Step 4 deliberately does not work the other way around. "Brown Sugar"
+    contains "Sugar", but they are different products, and merging them
+    would silently corrupt both stock counts.
+
+    Returns the Item or None.
+    """
+    if not name or not name.strip():
+        return None
+
+    query = name.strip()
+
+    # 1. Exact
+    item = db.query(models.Item).filter(models.Item.name.ilike(query)).first()
+    if item:
+        return item
+
+    # Everything below needs the full list. Kiryana inventories are small
+    # enough that this is cheaper than several more round trips.
+    all_items = db.query(models.Item).all()
+    if not all_items:
+        return None
+
+    # 2. Squashed — Chilli/Chili, Yoghurt/Yogurt
+    q_squash = _squash(query)
+    for candidate in all_items:
+        if _squash(candidate.name) == q_squash:
+            log.info("match: %r -> %r (spelling)", query, candidate.name)
+            return candidate
+
+    # 3. Close match by edit distance
+    q_norm = _norm(query)
+    by_norm = {_norm(c.name): c for c in all_items}
+    close = difflib.get_close_matches(q_norm, list(by_norm.keys()),
+                                      n=1, cutoff=cutoff)
+    if close:
+        candidate = by_norm[close[0]]
+        log.info("match: %r -> %r (close)", query, candidate.name)
+        return candidate
+
+    # 4. Partial, one direction only, and only if it is unambiguous
+    if allow_partial and len(q_norm) >= 3:
+        contains = [c for c in all_items if q_norm in _norm(c.name)]
+        if len(contains) == 1:
+            log.info("match: %r -> %r (partial)", query, contains[0].name)
+            return contains[0]
+        if len(contains) > 1:
+            log.info("match: %r is ambiguous across %s items",
+                     query, len(contains))
+
+    return None
 
 
 # -------------------------------------------------------------------------
@@ -198,8 +291,7 @@ def normalize_pack_pricing(item_name, qty, unit, price, line_amount):
     single tea row came to be 99% of a day's purchases.
 
     The tell is that RATE and AMOUNT are the same number: that only happens
-    when the quantity being priced is one of something. When we see it, we
-    fold the pack size into the name and store a single pack.
+    when the quantity being priced is one of something.
 
     Returns (qty, unit, price, name).
     """
@@ -261,6 +353,7 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
         Ignore any TOTAL, SUBTOTAL, CASH, CHANGE, TAX or DISCOUNT rows —
         those are not products.
         Translate names to English (e.g., Namak to Salt, Chini to Sugar).
+        Use the most common English spelling: "Chilli", "Yogurt", "Lentils".
 
         Format: [{"name": "Item", "qty": 1.0, "unit": "pcs",
                   "price": 0.0, "amount": 0.0}]
@@ -294,8 +387,10 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
             qty, unit, price, item_name = normalize_pack_pricing(
                 item_name, qty, unit, price, line_amount)
 
-            db_item = db.query(models.Item).filter(
-                models.Item.name.ilike(item_name)).first()
+            # Strict matching here: a wrong merge on a scan is worse than a
+            # duplicate row, because it silently inflates someone's stock.
+            db_item = find_item(db, item_name, allow_partial=False,
+                                cutoff=FUZZY_CUTOFF_SCAN)
 
             if not db_item:
                 db_item = models.Item(name=item_name, quantity=0.0, unit=unit)
@@ -320,9 +415,11 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
                 total_amount=round(qty * price, 2),
             ))
 
-            results_summary.append(f"Added {qty:g} {unit} of {item_name}")
+            # Report the STORED name, which may differ from what was read
+            # off the bill if an existing item matched.
+            results_summary.append(f"Added {qty:g} {unit} of {db_item.name}")
             items_for_flutter.append({
-                "name": item_name,
+                "name": db_item.name,
                 "qty": qty,
                 "unit": unit,
                 "price": float(db_item.cost_price or 0.0),
@@ -405,13 +502,15 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
             qty = to_float(a.get("qty"))
 
             if action == "QUERY":
-                db_item = db.query(models.Item).filter(
-                    models.Item.name.ilike(item_name)).first()
-                a["voice_response"] = (
-                    f"{db_item.name} ka stock {db_item.quantity:g} {db_item.unit} bacha hai."
-                    if db_item else
-                    f"Maaf kijie, {item_name} record mein nahi mila."
-                )
+                db_item = find_item(db, item_name, allow_partial=True)
+                if db_item:
+                    a["item"] = db_item.name
+                    a["voice_response"] = (
+                        f"{db_item.name} ka stock {db_item.quantity:g} "
+                        f"{db_item.unit} bacha hai.")
+                else:
+                    a["voice_response"] = (
+                        f"Maaf kijie, {item_name} record mein nahi mila.")
 
             elif action == "SUMMARY":
                 start, end, day = pkt_day_bounds()
@@ -429,20 +528,31 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                     if sales else "Aaj abhi tak koi sale nahi hui."
                 )
 
-            elif action == "STOCK_OUT":
-                db_item = db.query(models.Item).filter(
-                    models.Item.name.ilike(item_name)).first()
-                if not db_item:
-                    a["warning"] = f"{item_name} stock mein nahi hai."
-                elif db_item.quantity < qty:
-                    a["warning"] = (
-                        f"Sirf {db_item.quantity:g} {db_item.unit} {item_name} bacha hai.")
-                else:
-                    # Show the shopkeeper what this sale will come to
-                    # BEFORE they confirm it.
-                    rate = to_float(a.get("price")) or float(db_item.sale_price or 0.0)
-                    a["unit_price"] = rate
-                    a["line_total"] = round(qty * rate, 2)
+            elif action in ("STOCK_IN", "STOCK_OUT"):
+                db_item = find_item(db, item_name, allow_partial=True)
+
+                # THE KEY STEP: rewrite the name to the one actually stored.
+                # The confirm phase then looks up an exact match, so a
+                # spelling the model invented cannot break the write.
+                if db_item and db_item.name != item_name:
+                    log.info("voice: rewriting %r as %r",
+                             item_name, db_item.name)
+                    a["matched_from"] = item_name
+                    a["item"] = db_item.name
+
+                if action == "STOCK_OUT":
+                    if not db_item:
+                        a["warning"] = f"{item_name} stock mein nahi hai."
+                    elif db_item.quantity < qty:
+                        a["warning"] = (
+                            f"Sirf {db_item.quantity:g} {db_item.unit} "
+                            f"{db_item.name} bacha hai.")
+                    else:
+                        # Show what this sale comes to BEFORE confirming.
+                        rate = (to_float(a.get("price"))
+                                or float(db_item.sale_price or 0.0))
+                        a["unit_price"] = rate
+                        a["line_total"] = round(qty * rate, 2)
 
         needs_confirm = any(
             a.get("action") in ("STOCK_IN", "STOCK_OUT") for a in actions)
@@ -473,8 +583,9 @@ def execute_actions(actions, db):
             if qty <= 0:
                 raise ValueError(f"Invalid quantity for {item_name}")
 
-            db_item = db.query(models.Item).filter(
-                models.Item.name.ilike(item_name)).first()
+            # Fuzzy here too, as a safety net. The parse phase normally
+            # rewrites the name already, but a client could send anything.
+            db_item = find_item(db, item_name, allow_partial=True)
 
             if not db_item:
                 if action == "STOCK_OUT":
@@ -494,8 +605,8 @@ def execute_actions(actions, db):
             else:
                 if db_item.quantity < qty:
                     raise ValueError(
-                        f"Sirf {db_item.quantity:g} {db_item.unit} {item_name} bacha hai")
-                # Sale price: what was spoken, else the item's standing price.
+                        f"Sirf {db_item.quantity:g} {db_item.unit} "
+                        f"{db_item.name} bacha hai")
                 rate = spoken_price or float(db_item.sale_price or 0.0)
                 if spoken_price > 0:
                     db_item.sale_price = spoken_price
@@ -512,16 +623,15 @@ def execute_actions(actions, db):
                 total_amount=line_total,
             ))
 
-            # Say what HAPPENED, then what is left. The old wording put the
-            # remaining stock next to the sale amount, which read as though
-            # 1 kg of sugar had sold for Rs 370.
+            # Say what HAPPENED, then what is left.
             if action == "STOCK_OUT":
                 results.append(
-                    f"Sold {qty:g} {db_item.unit} {item_name} — "
-                    f"Rs {line_total:,.0f} ({db_item.quantity:g} {db_item.unit} left)")
+                    f"Sold {qty:g} {db_item.unit} {db_item.name} — "
+                    f"Rs {line_total:,.0f} "
+                    f"({db_item.quantity:g} {db_item.unit} left)")
             else:
                 results.append(
-                    f"Added {qty:g} {db_item.unit} {item_name} "
+                    f"Added {qty:g} {db_item.unit} {db_item.name} "
                     f"({db_item.quantity:g} {db_item.unit} in stock)")
 
         db.commit()
@@ -663,6 +773,39 @@ def get_inventory(db: Session = Depends(get_db)):
     except Exception as e:
         log.error("INVENTORY ERROR: %s", e)
         return []
+
+
+@app.get("/items/{item_id}/transactions")
+def item_transactions(item_id: int, limit: int = Query(50, ge=1, le=500),
+                      db: Session = Depends(get_db)):
+    """Movement history for one item, newest first.
+
+    The app's Item Detail screen currently reads this from its local Drift
+    database, which never sees voice sales or bill scans — so that history
+    shows empty. Point it here instead.
+    """
+    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    rows = (db.query(models.StockTransaction)
+            .filter(models.StockTransaction.item_id == item_id)
+            .order_by(models.StockTransaction.timestamp.desc())
+            .limit(limit).all())
+
+    return {
+        "item": item.name,
+        "unit": item.unit,
+        "transactions": [{
+            "id": r.id,
+            "type": r.type,
+            "quantity": float(r.quantity or 0.0),
+            "unit_price": float(r.unit_price or 0.0),
+            "amount": float(r.total_amount or 0.0),
+            "timestamp": (r.timestamp.replace(tzinfo=datetime.timezone.utc)
+                          .astimezone(PKT).isoformat()),
+        } for r in rows],
+    }
 
 
 class PriceUpdate(BaseModel):
