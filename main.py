@@ -187,6 +187,134 @@ def customer_balance(db, customer_id):
     return round(udhaar - jama, 2)
 
 
+
+# -------------------------------------------------------------------------
+# UNITS
+# -------------------------------------------------------------------------
+# Stock is held in whatever unit the purchase bill used, but people speak in
+# whatever is natural: eggs arrive by the dozen and sell by the piece, tea
+# arrives as a 500gm pack and sells in 100gm scoops.
+#
+# Without conversion the quantities are compared and multiplied as if they
+# were the same unit, which is how "1 packet tea @ 1450" became a Rs 145,000
+# sale, and how selling 6 eggs out of 1 dozen failed for insufficient stock.
+
+WEIGHT_UNITS = {"kg": 1000.0, "kilo": 1000.0, "kilos": 1000.0,
+                "kilogram": 1000.0, "kilograms": 1000.0,
+                "g": 1.0, "gm": 1.0, "gms": 1.0, "gram": 1.0, "grams": 1.0}
+
+VOLUME_UNITS = {"ltr": 1000.0, "l": 1000.0, "litre": 1000.0, "litres": 1000.0,
+                "liter": 1000.0, "liters": 1000.0,
+                "ml": 1.0, "millilitre": 1.0, "millilitres": 1.0}
+
+COUNT_UNITS = {"pcs": 1.0, "pc": 1.0, "piece": 1.0, "pieces": 1.0,
+               "adad": 1.0, "unit": 1.0, "units": 1.0,
+               "dozen": 12.0, "dozens": 12.0, "darjan": 12.0, "dz": 12.0}
+
+PACK_UNITS = {"pack", "packs", "packet", "packets", "pkt", "bag", "bags",
+              "box", "boxes", "bottle", "bottles", "tin", "tins"}
+
+# "Tea Leaves 500gm" -> 500 grams. This is why scan_bill folds the pack size
+# into the name: it is the only place that information survives.
+PACK_SIZE_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*(kg|g|gm|gram|grams|ml|l|ltr|litre|liter)\b',
+    re.IGNORECASE)
+
+
+def canon_unit(u):
+    return re.sub(r'[^a-z]', '', (u or '').lower().strip())
+
+
+def unit_family(u):
+    """Returns (family, multiplier-to-base) or (None, None)."""
+    u = canon_unit(u)
+    if u in WEIGHT_UNITS:
+        return "weight", WEIGHT_UNITS[u]
+    if u in VOLUME_UNITS:
+        return "volume", VOLUME_UNITS[u]
+    if u in COUNT_UNITS:
+        return "count", COUNT_UNITS[u]
+    return None, None
+
+
+def pack_size_from_name(name):
+    """Pack size embedded in an item name, in base units."""
+    m = PACK_SIZE_RE.search(name or "")
+    if not m:
+        return None, None
+    fam, mult = unit_family(m.group(2))
+    if not fam:
+        return None, None
+    return fam, float(m.group(1)) * mult
+
+
+def convert_qty(qty, spoken_unit, stored_unit, item_name):
+    """
+    Express a spoken quantity in the unit the stock is actually held in.
+
+    Returns (converted_qty, note) where note explains the conversion, or
+    (None, reason) when the two units cannot be reconciled — in which case
+    the caller must refuse rather than guess.
+    """
+    spoken = canon_unit(spoken_unit)
+    stored = canon_unit(stored_unit)
+
+    if not spoken or spoken == stored:
+        return qty, None
+
+    sf, sm = unit_family(spoken)
+    tf, tm = unit_family(stored)
+
+    # Same family: grams to kilos, pieces to dozens.
+    if sf and tf and sf == tf:
+        converted = qty * sm / tm
+        return converted, f"{qty:g} {spoken_unit} = {converted:g} {stored_unit}"
+
+    # Stock is in packs, spoken in weight or volume: use the pack size.
+    if stored in PACK_UNITS:
+        pf, psize = pack_size_from_name(item_name)
+        if pf and psize and sf == pf:
+            converted = qty * sm / psize
+            return converted, (f"{qty:g} {spoken_unit} = {converted:g} "
+                               f"{stored_unit} of {item_name}")
+        if sf:
+            return None, (f"{item_name} ka stock {stored_unit} mein hai, "
+                          f"pack size maloom nahi.")
+
+    # Spoken in packs, stock in weight or volume.
+    if spoken in PACK_UNITS and tf:
+        pf, psize = pack_size_from_name(item_name)
+        if pf and pf == tf and psize:
+            converted = qty * psize / tm
+            return converted, (f"{qty:g} {spoken_unit} = {converted:g} "
+                               f"{stored_unit}")
+
+    # An unknown unit on either side is not a conversion failure — the
+    # model often omits it entirely. Treat it as already correct.
+    if not sf or not tf:
+        return qty, None
+
+    return None, (f"{spoken_unit} ko {stored_unit} mein badla nahi ja sakta.")
+
+
+def resolve_qty(a, db_item, qty):
+    """Convert a spoken quantity for an item, recording what happened on the
+    action so the app can show it and the confirm phase reuses it."""
+    converted, note = convert_qty(qty, a.get("unit"), db_item.unit,
+                                  db_item.name)
+    if converted is None:
+        a["warning"] = note
+        return None
+    if note:
+        log.info("units: %s", note)
+        a["unit_note"] = note
+        a["spoken_qty"] = qty
+        a["spoken_unit"] = a.get("unit")
+        a["qty"] = converted
+        a["unit"] = db_item.unit
+    return converted
+
+
 # -------------------------------------------------------------------------
 # HELPERS
 # -------------------------------------------------------------------------
@@ -470,6 +598,11 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
     If the user states a price ("200 rupay kilo", "150 ka becha"), put the
     PER-UNIT price in "price". If no price is mentioned, use 0.
 
+    UNITS: report the unit the user actually SAID, do not convert it
+    yourself. "aadha darjan anday" is qty=0.5 unit="dozen", NOT qty=6.
+    "100 gram chai" is qty=100 unit="gm". The server knows how the stock
+    is held and converts.
+
     Translation Mapping:
     - Namak -> Salt, Chini/Shakar -> Sugar, Pani -> Water, Dudh -> Milk, Atta -> Flour.
 
@@ -599,19 +732,23 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                     db_item = find_item(db, item_name, allow_partial=True)
                     if not db_item:
                         a["warning"] = f"{item_name} stock mein nahi hai."
-                    elif db_item.quantity < qty:
-                        a["warning"] = (
-                            f"Sirf {db_item.quantity:g} {db_item.unit} "
-                            f"{db_item.name} bacha hai.")
                     else:
                         a["item"] = db_item.name
-                        rate = (to_float(a.get("price"))
-                                or float(db_item.sale_price or 0.0))
-                        a["unit_price"] = rate
-                        a["amount"] = round(qty * rate, 2)
-                        if rate <= 0:
+                        qty = resolve_qty(a, db_item, qty)
+                        if qty is None:
+                            continue
+                        if db_item.quantity < qty:
                             a["warning"] = (
-                                f"{db_item.name} ka rate set nahi hai.")
+                                f"Sirf {db_item.quantity:g} {db_item.unit} "
+                                f"{db_item.name} bacha hai.")
+                        else:
+                            rate = (to_float(a.get("price"))
+                                    or float(db_item.sale_price or 0.0))
+                            a["unit_price"] = rate
+                            a["amount"] = round(qty * rate, 2)
+                            if rate <= 0:
+                                a["warning"] = (
+                                    f"{db_item.name} ka rate set nahi hai.")
                 else:
                     a["amount"] = to_float(a.get("amount"))
                     if a["amount"] <= 0:
@@ -628,18 +765,25 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                     a["matched_from"] = item_name
                     a["item"] = db_item.name
 
+                if db_item and action == "STOCK_IN":
+                    resolve_qty(a, db_item, qty)
+
                 if action == "STOCK_OUT":
                     if not db_item:
                         a["warning"] = f"{item_name} stock mein nahi hai."
-                    elif db_item.quantity < qty:
-                        a["warning"] = (
-                            f"Sirf {db_item.quantity:g} {db_item.unit} "
-                            f"{db_item.name} bacha hai.")
                     else:
-                        rate = (to_float(a.get("price"))
-                                or float(db_item.sale_price or 0.0))
-                        a["unit_price"] = rate
-                        a["line_total"] = round(qty * rate, 2)
+                        qty = resolve_qty(a, db_item, qty)
+                        if qty is None:
+                            continue
+                        if db_item.quantity < qty:
+                            a["warning"] = (
+                                f"Sirf {db_item.quantity:g} {db_item.unit} "
+                                f"{db_item.name} bacha hai.")
+                        else:
+                            rate = (to_float(a.get("price"))
+                                    or float(db_item.sale_price or 0.0))
+                            a["unit_price"] = rate
+                            a["line_total"] = round(qty * rate, 2)
 
         needs_confirm = any(
             a.get("action") in VOICE_WRITE_ACTIONS for a in actions)
@@ -685,6 +829,16 @@ def execute_actions(actions, db):
                     name=item_name, quantity=0.0, unit=a.get("unit", "pcs"))
                 db.add(db_item)
                 db.flush()
+
+            # The parse phase normally converts already, but a client could
+            # send anything, so never write an unconverted quantity.
+            converted, note = convert_qty(qty, a.get("unit"), db_item.unit,
+                                          db_item.name)
+            if converted is None:
+                raise ValueError(note)
+            if note:
+                log.info("units: %s", note)
+            qty = converted
 
             spoken_price = to_float(a.get("price"))
 
@@ -783,6 +937,15 @@ def _commit_khata(a, db):
     db_item = find_item(db, item_name, allow_partial=True)
     if not db_item:
         raise ValueError(f"{item_name} stock mein nahi hai")
+
+    converted, note = convert_qty(qty, a.get("unit"), db_item.unit,
+                                  db_item.name)
+    if converted is None:
+        raise ValueError(note)
+    if note:
+        log.info("units: %s", note)
+    qty = converted
+
     if db_item.quantity < qty:
         raise ValueError(f"Sirf {db_item.quantity:g} {db_item.unit} "
                          f"{db_item.name} bacha hai")
