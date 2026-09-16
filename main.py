@@ -75,14 +75,17 @@ BUSY_MARKERS = ("503", "429", "overload", "unavailable", "quota",
                 "rate limit", "resource_exhausted")
 
 # A single line on a kiryana bill should never legitimately exceed this.
-# Anything above it means a unit/price mix-up, not a real purchase.
 MAX_SANE_LINE_AMOUNT = 500_000
 
-# How alike two names must be before they are treated as the same product.
-# Higher = stricter. Scans use the stricter value because wrongly merging
-# two products corrupts stock counts permanently.
+# How alike two names must be before they are treated as the same thing.
+# Scans use the stricter value because wrongly merging two products
+# corrupts stock counts permanently.
 FUZZY_CUTOFF_VOICE = 0.82
 FUZZY_CUTOFF_SCAN = 0.90
+
+# Customer names are shorter and more varied than product names, so a
+# slightly looser threshold works better — "Ali" vs "Ali Bhai".
+FUZZY_CUTOFF_CUSTOMER = 0.80
 
 
 class VoiceInput(BaseModel):
@@ -104,59 +107,49 @@ def _squash(s):
     """Normalised form with doubled letters collapsed and spaces removed.
 
     This is what catches Chilli vs Chili, Yoghurt vs Yogurt, Dal vs Daal —
-    the spellings Gemini alternates between for the same product.
+    the spellings Gemini alternates between for the same thing.
     """
     return re.sub(r'(.)\1+', r'\1', _norm(s).replace(' ', ''))
 
 
-def find_item(db, name, allow_partial=False, cutoff=FUZZY_CUTOFF_VOICE):
+def find_by_name(db, model, name, allow_partial=False,
+                 cutoff=FUZZY_CUTOFF_VOICE):
     """
-    Look up an item by name, tolerating the spelling drift that comes from
-    passing product names through a language model.
-
-    Gemini returned "Red Chili Powder" for stock that was saved as
-    "Red Chilli Powder", and an exact ilike found nothing — so a sale of
-    stock that plainly existed failed with "stock mein nahi hai".
+    Look up a row by name, tolerating the spelling drift that comes from
+    passing names through a language model and a speech recogniser.
 
     Tried in order, stopping at the first hit:
       1. exact match (case-insensitive)
       2. squashed match — handles doubled-letter spellings
       3. close match by edit distance
-      4. partial match, voice only, and only when the stored name CONTAINS
-         the spoken one ("rice" finding "Basmati Rice")
+      4. partial match, and only when the STORED name contains the spoken
+         one ("masoor" finding "Lentils (Masoor)")
 
     Step 4 deliberately does not work the other way around. "Brown Sugar"
     contains "Sugar", but they are different products, and merging them
     would silently corrupt both stock counts.
-
-    Returns the Item or None.
     """
     if not name or not name.strip():
         return None
 
     query = name.strip()
 
-    # 1. Exact
-    item = db.query(models.Item).filter(models.Item.name.ilike(query)).first()
+    item = db.query(model).filter(model.name.ilike(query)).first()
     if item:
         return item
 
-    # Everything below needs the full list. Kiryana inventories are small
-    # enough that this is cheaper than several more round trips.
-    all_items = db.query(models.Item).all()
-    if not all_items:
+    all_rows = db.query(model).all()
+    if not all_rows:
         return None
 
-    # 2. Squashed — Chilli/Chili, Yoghurt/Yogurt
     q_squash = _squash(query)
-    for candidate in all_items:
+    for candidate in all_rows:
         if _squash(candidate.name) == q_squash:
             log.info("match: %r -> %r (spelling)", query, candidate.name)
             return candidate
 
-    # 3. Close match by edit distance
     q_norm = _norm(query)
-    by_norm = {_norm(c.name): c for c in all_items}
+    by_norm = {_norm(c.name): c for c in all_rows}
     close = difflib.get_close_matches(q_norm, list(by_norm.keys()),
                                       n=1, cutoff=cutoff)
     if close:
@@ -164,17 +157,34 @@ def find_item(db, name, allow_partial=False, cutoff=FUZZY_CUTOFF_VOICE):
         log.info("match: %r -> %r (close)", query, candidate.name)
         return candidate
 
-    # 4. Partial, one direction only, and only if it is unambiguous
     if allow_partial and len(q_norm) >= 3:
-        contains = [c for c in all_items if q_norm in _norm(c.name)]
+        contains = [c for c in all_rows if q_norm in _norm(c.name)]
         if len(contains) == 1:
             log.info("match: %r -> %r (partial)", query, contains[0].name)
             return contains[0]
         if len(contains) > 1:
-            log.info("match: %r is ambiguous across %s items",
+            log.info("match: %r is ambiguous across %s rows",
                      query, len(contains))
 
     return None
+
+
+def find_item(db, name, allow_partial=False, cutoff=FUZZY_CUTOFF_VOICE):
+    return find_by_name(db, models.Item, name, allow_partial, cutoff)
+
+
+def find_customer(db, name, allow_partial=True):
+    return find_by_name(db, models.Customer, name, allow_partial,
+                        FUZZY_CUTOFF_CUSTOMER)
+
+
+def customer_balance(db, customer_id):
+    """Positive = customer owes the shop. Negative = the shop owes them."""
+    rows = db.query(models.KhataEntry).filter(
+        models.KhataEntry.customer_id == customer_id).all()
+    udhaar = sum(r.amount or 0.0 for r in rows if r.type == 'udhaar')
+    jama = sum(r.amount or 0.0 for r in rows if r.type == 'jama')
+    return round(udhaar - jama, 2)
 
 
 # -------------------------------------------------------------------------
@@ -189,6 +199,10 @@ def pkt_day_bounds(day=None):
     end_local = start_local + datetime.timedelta(days=1)
     to_utc = lambda d: d.astimezone(datetime.timezone.utc).replace(tzinfo=None)
     return to_utc(start_local), to_utc(end_local), day
+
+
+def to_pkt(dt):
+    return dt.replace(tzinfo=datetime.timezone.utc).astimezone(PKT)
 
 
 def clean_json_response(text_in):
@@ -287,13 +301,9 @@ def normalize_pack_pricing(item_name, qty, unit, price, line_amount):
     """
     Bills price packaged goods by the PACK, not by the gram or millilitre.
     "Tea Leaves | 950 gm | 1,450 | 1,450" means Rs 1450 for one 950gm pack —
-    NOT Rs 1450 per gram. Multiplying gives Rs 1,377,500, which is how a
-    single tea row came to be 99% of a day's purchases.
+    NOT Rs 1450 per gram. Multiplying gives Rs 1,377,500.
 
-    The tell is that RATE and AMOUNT are the same number: that only happens
-    when the quantity being priced is one of something.
-
-    Returns (qty, unit, price, name).
+    The tell is that RATE and AMOUNT are the same number.
     """
     if qty > 1 and line_amount > 0 and abs(line_amount - price) < 0.01:
         packed_name = item_name
@@ -304,7 +314,6 @@ def normalize_pack_pricing(item_name, qty, unit, price, line_amount):
                  item_name, price)
         return 1.0, "pack", price, packed_name
 
-    # Second guard: a per-unit rate that produces an absurd line total.
     if qty > 1 and price > 0 and qty * price > MAX_SANE_LINE_AMOUNT:
         log.warning("scan-bill: %r line total %s is implausible, treating "
                     "the price as a pack price", item_name, qty * price)
@@ -350,8 +359,7 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
         NOT qty=950 with price=1450, which would mean Rs 1,377,500.
 
         Return numbers as plain numbers: 1450, not "1,450" or "Rs 1450".
-        Ignore any TOTAL, SUBTOTAL, CASH, CHANGE, TAX or DISCOUNT rows —
-        those are not products.
+        Ignore any TOTAL, SUBTOTAL, CASH, CHANGE, TAX or DISCOUNT rows.
         Translate names to English (e.g., Namak to Salt, Chini to Sugar).
         Use the most common English spelling: "Chilli", "Yogurt", "Lentils".
 
@@ -383,11 +391,10 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
                 log.warning("scan-bill: skipping bad row %r", entry)
                 continue
 
-            # Catch pack-priced rows before they multiply out to nonsense.
             qty, unit, price, item_name = normalize_pack_pricing(
                 item_name, qty, unit, price, line_amount)
 
-            # Strict matching here: a wrong merge on a scan is worse than a
+            # Strict matching: a wrong merge on a scan is worse than a
             # duplicate row, because it silently inflates someone's stock.
             db_item = find_item(db, item_name, allow_partial=False,
                                 cutoff=FUZZY_CUTOFF_SCAN)
@@ -397,12 +404,8 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
                 db.add(db_item)
                 db.flush()
 
-            # A purchase bill shows what the shopkeeper PAID — that is
-            # cost_price. Selling price is set separately.
             if price > 0:
                 db_item.cost_price = price
-                # First time we see this item there is no sale price yet,
-                # so seed it from cost. The shopkeeper can change it later.
                 if not db_item.sale_price:
                     db_item.sale_price = price
 
@@ -415,8 +418,6 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
                 total_amount=round(qty * price, 2),
             ))
 
-            # Report the STORED name, which may differ from what was read
-            # off the bill if an existing item matched.
             results_summary.append(f"Added {qty:g} {unit} of {db_item.name}")
             items_for_flutter.append({
                 "name": db_item.name,
@@ -450,6 +451,9 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
 # -------------------------------------------------------------------------
 # 3. MAIN VOICE PROCESSOR
 # -------------------------------------------------------------------------
+VOICE_WRITE_ACTIONS = ("STOCK_IN", "STOCK_OUT", "KHATA_UDHAAR", "KHATA_JAMA")
+
+
 @app.post("/voice/process")
 async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
     if data.confirm:
@@ -475,14 +479,39 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
     - 'becha', 'bech di', 'sell', 'nikal do' -> "STOCK_OUT"
     - 'aaj ki sale', 'aaj ka hisab' -> "SUMMARY"
 
+    KHATA (customer credit ledger) — these ALWAYS name a person:
+    - 'X ko ... udhaar', 'X ko ... dediya', 'X ke khate mein likho'
+        -> "KHATA_UDHAAR"  (customer took goods or cash on credit)
+    - 'X ne ... rupay diye', 'X ne payment ki', 'X se ... mila'
+        -> "KHATA_JAMA"    (customer paid money back)
+    - 'X ka hisab', 'X kitna deta hai', 'X ka balance'
+        -> "KHATA_BALANCE"
+
+    For khata commands put the PERSON'S NAME in "customer".
+    If goods were given, also fill "item", "qty" and "unit" — leave "amount"
+    as 0 and the server will price it from stock.
+    If only money was involved, fill "amount" and leave "item" empty.
+
+    Examples:
+    "Ali ko 5 kilo chini udhaar" ->
+      {{"action":"KHATA_UDHAAR","customer":"Ali","item":"Sugar","qty":5,
+        "unit":"kg","amount":0,"price":0,
+        "voice_response":"Ali ke khate mein 5 kilo cheeni likh di."}}
+    "Ali ne 1000 rupay diye" ->
+      {{"action":"KHATA_JAMA","customer":"Ali","item":"","qty":0,
+        "unit":"","amount":1000,"price":0,
+        "voice_response":"Ali se 1000 rupay wasool huye."}}
+
     Return ONLY a JSON ARRAY, even when there is just one command:
     [
       {{
-        "action": "STOCK_IN / STOCK_OUT / QUERY / SUMMARY",
+        "action": "STOCK_IN / STOCK_OUT / QUERY / SUMMARY / KHATA_UDHAAR / KHATA_JAMA / KHATA_BALANCE",
         "item": "Standard English Name",
+        "customer": "Person name, or empty",
         "qty": 0.0,
         "unit": "kg / pcs / pack",
         "price": 0.0,
+        "amount": 0.0,
         "voice_response": "Natural Urdu response"
       }}
     ]
@@ -499,6 +528,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
         for a in actions:
             action = a.get("action")
             item_name = (a.get("item") or "").strip()
+            customer_name = (a.get("customer") or "").strip()
             qty = to_float(a.get("qty"))
 
             if action == "QUERY":
@@ -528,12 +558,70 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                     if sales else "Aaj abhi tak koi sale nahi hui."
                 )
 
+            elif action == "KHATA_BALANCE":
+                cust = find_customer(db, customer_name)
+                if not cust:
+                    a["voice_response"] = (
+                        f"{customer_name} ka koi khata nahi hai.")
+                else:
+                    a["customer"] = cust.name
+                    bal = customer_balance(db, cust.id)
+                    a["balance"] = bal
+                    if bal > 0:
+                        a["voice_response"] = (
+                            f"{cust.name} ne {bal:,.0f} rupay dene hain.")
+                    elif bal < 0:
+                        a["voice_response"] = (
+                            f"Aap ne {cust.name} ko {abs(bal):,.0f} "
+                            f"rupay dene hain.")
+                    else:
+                        a["voice_response"] = f"{cust.name} ka hisab saaf hai."
+
+            elif action in ("KHATA_UDHAAR", "KHATA_JAMA"):
+                if not customer_name:
+                    a["warning"] = "Kis ka khata? Naam nahi samjha."
+                    continue
+
+                cust = find_customer(db, customer_name)
+                if cust:
+                    if cust.name != customer_name:
+                        a["matched_from"] = customer_name
+                    a["customer"] = cust.name
+                    a["current_balance"] = customer_balance(db, cust.id)
+                else:
+                    # Not an error — a new khata gets opened on confirm.
+                    # But say so, because a mis-heard name should not
+                    # silently create a second account for the same person.
+                    a["new_customer"] = True
+                    a["current_balance"] = 0.0
+
+                if action == "KHATA_UDHAAR" and item_name:
+                    db_item = find_item(db, item_name, allow_partial=True)
+                    if not db_item:
+                        a["warning"] = f"{item_name} stock mein nahi hai."
+                    elif db_item.quantity < qty:
+                        a["warning"] = (
+                            f"Sirf {db_item.quantity:g} {db_item.unit} "
+                            f"{db_item.name} bacha hai.")
+                    else:
+                        a["item"] = db_item.name
+                        rate = (to_float(a.get("price"))
+                                or float(db_item.sale_price or 0.0))
+                        a["unit_price"] = rate
+                        a["amount"] = round(qty * rate, 2)
+                        if rate <= 0:
+                            a["warning"] = (
+                                f"{db_item.name} ka rate set nahi hai.")
+                else:
+                    a["amount"] = to_float(a.get("amount"))
+                    if a["amount"] <= 0:
+                        a["warning"] = "Kitne rupay? Amount nahi samjha."
+
             elif action in ("STOCK_IN", "STOCK_OUT"):
                 db_item = find_item(db, item_name, allow_partial=True)
 
-                # THE KEY STEP: rewrite the name to the one actually stored.
-                # The confirm phase then looks up an exact match, so a
-                # spelling the model invented cannot break the write.
+                # THE KEY STEP: rewrite the name to the one actually stored,
+                # so the confirm phase looks up an exact match.
                 if db_item and db_item.name != item_name:
                     log.info("voice: rewriting %r as %r",
                              item_name, db_item.name)
@@ -548,14 +636,13 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                             f"Sirf {db_item.quantity:g} {db_item.unit} "
                             f"{db_item.name} bacha hai.")
                     else:
-                        # Show what this sale comes to BEFORE confirming.
                         rate = (to_float(a.get("price"))
                                 or float(db_item.sale_price or 0.0))
                         a["unit_price"] = rate
                         a["line_total"] = round(qty * rate, 2)
 
         needs_confirm = any(
-            a.get("action") in ("STOCK_IN", "STOCK_OUT") for a in actions)
+            a.get("action") in VOICE_WRITE_ACTIONS for a in actions)
         return {"actions": actions, "needs_confirm": needs_confirm}
 
     except HTTPException:
@@ -569,13 +656,19 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
 
 
 def execute_actions(actions, db):
-    """Commits confirmed STOCK_IN / STOCK_OUT actions. All-or-nothing."""
+    """Commits confirmed write actions. All-or-nothing."""
     results = []
     sale_total = 0.0
     try:
         for a in actions:
             action = a.get("action")
-            if action not in ("STOCK_IN", "STOCK_OUT"):
+            if action not in VOICE_WRITE_ACTIONS:
+                continue
+
+            if action in ("KHATA_UDHAAR", "KHATA_JAMA"):
+                line, credited = _commit_khata(a, db)
+                results.append(line)
+                sale_total += credited
                 continue
 
             item_name = (a.get("item") or "").strip()
@@ -583,8 +676,6 @@ def execute_actions(actions, db):
             if qty <= 0:
                 raise ValueError(f"Invalid quantity for {item_name}")
 
-            # Fuzzy here too, as a safety net. The parse phase normally
-            # rewrites the name already, but a client could send anything.
             db_item = find_item(db, item_name, allow_partial=True)
 
             if not db_item:
@@ -623,7 +714,6 @@ def execute_actions(actions, db):
                 total_amount=line_total,
             ))
 
-            # Say what HAPPENED, then what is left.
             if action == "STOCK_OUT":
                 results.append(
                     f"Sold {qty:g} {db_item.unit} {db_item.name} — "
@@ -648,15 +738,270 @@ def execute_actions(actions, db):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+def _commit_khata(a, db):
+    """Writes one khata entry. Returns (summary line, revenue recognised).
+
+    Goods given on credit are a SALE — stock leaves and the shop has earned
+    the money, it just has not been paid yet. So this writes both a
+    StockTransaction and a KhataEntry. Cash repayments touch neither stock
+    nor revenue; they only move the balance.
+    """
+    action = a.get("action")
+    customer_name = (a.get("customer") or "").strip()
+    if not customer_name:
+        raise ValueError("Customer ka naam nahi mila")
+
+    cust = find_customer(db, customer_name)
+    if not cust:
+        cust = models.Customer(name=customer_name)
+        db.add(cust)
+        db.flush()
+        log.info("khata: opened new account for %r", customer_name)
+
+    item_name = (a.get("item") or "").strip()
+    qty = to_float(a.get("qty"))
+    amount = to_float(a.get("amount"))
+    revenue = 0.0
+
+    # --- money only ---
+    if action == "KHATA_JAMA" or not item_name:
+        if amount <= 0:
+            raise ValueError("Amount zero hai")
+
+        db.add(models.KhataEntry(
+            customer_id=cust.id,
+            type='jama' if action == "KHATA_JAMA" else 'udhaar',
+            amount=amount,
+            note=a.get("note"),
+        ))
+        bal = customer_balance(db, cust.id)
+        verb = "paid" if action == "KHATA_JAMA" else "took"
+        return (f"{cust.name} {verb} Rs {amount:,.0f} "
+                f"(balance Rs {bal:,.0f})"), revenue
+
+    # --- goods on credit ---
+    db_item = find_item(db, item_name, allow_partial=True)
+    if not db_item:
+        raise ValueError(f"{item_name} stock mein nahi hai")
+    if db_item.quantity < qty:
+        raise ValueError(f"Sirf {db_item.quantity:g} {db_item.unit} "
+                         f"{db_item.name} bacha hai")
+
+    rate = (to_float(a.get("unit_price")) or to_float(a.get("price"))
+            or float(db_item.sale_price or 0.0))
+    if rate <= 0:
+        raise ValueError(f"{db_item.name} ka rate set nahi hai")
+
+    line_total = round(qty * rate, 2)
+
+    db_item.quantity -= qty
+    db.add(models.StockTransaction(
+        item_id=db_item.id,
+        type="out",
+        quantity=qty,
+        unit_price=rate,
+        total_amount=line_total,
+    ))
+    db.add(models.KhataEntry(
+        customer_id=cust.id,
+        type='udhaar',
+        amount=line_total,
+        item_id=db_item.id,
+        quantity=qty,
+        unit_price=rate,
+        note=f"{qty:g} {db_item.unit} {db_item.name}",
+    ))
+    revenue = line_total
+
+    bal = customer_balance(db, cust.id)
+    return (f"{cust.name} took {qty:g} {db_item.unit} {db_item.name} "
+            f"on credit — Rs {line_total:,.0f} (balance Rs {bal:,.0f})"), revenue
+
+
 # -------------------------------------------------------------------------
-# 4. REPORTS
+# 4. KHATA LEDGER
+# -------------------------------------------------------------------------
+class CustomerIn(BaseModel):
+    name: str
+    phone: str | None = None
+
+
+class EntryIn(BaseModel):
+    type: str               # 'udhaar' or 'jama'
+    amount: float
+    note: str | None = None
+
+
+@app.get("/khata/customers")
+def list_customers(db: Session = Depends(get_db)):
+    """Everyone with an account, and what each one owes.
+
+    Sorted by who owes most, because that is the list a shopkeeper
+    actually wants to look at.
+    """
+    customers = db.query(models.Customer).all()
+    entries = db.query(models.KhataEntry).all()
+
+    totals = {}
+    last_seen = {}
+    for e in entries:
+        bucket = totals.setdefault(e.customer_id, {"udhaar": 0.0, "jama": 0.0})
+        bucket[e.type] = bucket.get(e.type, 0.0) + (e.amount or 0.0)
+        if e.timestamp and (e.customer_id not in last_seen
+                            or e.timestamp > last_seen[e.customer_id]):
+            last_seen[e.customer_id] = e.timestamp
+
+    out = []
+    for c in customers:
+        t = totals.get(c.id, {"udhaar": 0.0, "jama": 0.0})
+        balance = round(t.get("udhaar", 0.0) - t.get("jama", 0.0), 2)
+        seen = last_seen.get(c.id)
+        out.append({
+            "id": c.id,
+            "name": c.name,
+            "phone": c.phone,
+            "balance": balance,
+            "total_udhaar": round(t.get("udhaar", 0.0), 2),
+            "total_jama": round(t.get("jama", 0.0), 2),
+            "last_activity": to_pkt(seen).isoformat() if seen else None,
+        })
+
+    out.sort(key=lambda x: x["balance"], reverse=True)
+
+    return {
+        "customers": out,
+        "total_receivable": round(
+            sum(c["balance"] for c in out if c["balance"] > 0), 2),
+        "total_payable": round(
+            sum(-c["balance"] for c in out if c["balance"] < 0), 2),
+    }
+
+
+@app.post("/khata/customers")
+def add_customer(body: CustomerIn, db: Session = Depends(get_db)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+
+    existing = find_customer(db, name, allow_partial=False)
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{existing.name} already has a khata")
+
+    cust = models.Customer(name=name, phone=body.phone)
+    db.add(cust)
+    db.commit()
+    return {"status": "success", "id": cust.id, "name": cust.name,
+            "phone": cust.phone, "balance": 0.0}
+
+
+@app.get("/khata/customers/{customer_id}")
+def customer_detail(customer_id: int, db: Session = Depends(get_db)):
+    """One customer's full ledger, newest entry first, with a running
+    balance so the shopkeeper can see how it got to where it is."""
+    cust = db.query(models.Customer).filter(
+        models.Customer.id == customer_id).first()
+    if not cust:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    rows = (db.query(models.KhataEntry)
+            .filter(models.KhataEntry.customer_id == customer_id)
+            .order_by(models.KhataEntry.timestamp).all())
+
+    running = 0.0
+    entries = []
+    for r in rows:
+        amount = r.amount or 0.0
+        running += amount if r.type == 'udhaar' else -amount
+        entries.append({
+            "id": r.id,
+            "type": r.type,
+            "amount": round(amount, 2),
+            "note": r.note,
+            "quantity": float(r.quantity) if r.quantity else None,
+            "unit_price": float(r.unit_price) if r.unit_price else None,
+            "balance_after": round(running, 2),
+            "timestamp": to_pkt(r.timestamp).isoformat() if r.timestamp else None,
+        })
+
+    entries.reverse()
+
+    return {
+        "id": cust.id,
+        "name": cust.name,
+        "phone": cust.phone,
+        "balance": round(running, 2),
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
+@app.post("/khata/customers/{customer_id}/entries")
+def add_entry(customer_id: int, body: EntryIn, db: Session = Depends(get_db)):
+    """Manual ledger entry — cash lent or repaid, no stock involved."""
+    cust = db.query(models.Customer).filter(
+        models.Customer.id == customer_id).first()
+    if not cust:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    entry_type = (body.type or "").strip().lower()
+    if entry_type not in ("udhaar", "jama"):
+        raise HTTPException(status_code=400,
+                            detail="type must be 'udhaar' or 'jama'")
+    if body.amount <= 0:
+        raise HTTPException(status_code=400,
+                            detail="Amount must be greater than zero")
+
+    db.add(models.KhataEntry(
+        customer_id=cust.id,
+        type=entry_type,
+        amount=body.amount,
+        note=body.note,
+    ))
+    db.commit()
+
+    return {"status": "success", "customer": cust.name,
+            "balance": customer_balance(db, cust.id)}
+
+
+@app.delete("/khata/entries/{entry_id}")
+def delete_entry(entry_id: int, db: Session = Depends(get_db)):
+    """Removes a ledger line. Does NOT restore stock — if goods went out on
+    a mistaken entry, correct the stock separately so the two decisions stay
+    visible rather than one silently undoing the other."""
+    entry = db.query(models.KhataEntry).filter(
+        models.KhataEntry.id == entry_id).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Entry not found")
+
+    customer_id = entry.customer_id
+    had_stock = entry.item_id is not None
+    db.delete(entry)
+    db.commit()
+
+    return {
+        "status": "success",
+        "balance": customer_balance(db, customer_id),
+        "stock_unchanged": had_stock,
+    }
+
+
+# -------------------------------------------------------------------------
+# 5. REPORTS
 # -------------------------------------------------------------------------
 @app.get("/reports/daily")
 def daily_report(
     date: str | None = Query(None, description="YYYY-MM-DD, defaults to today"),
     db: Session = Depends(get_db),
 ):
-    """Day-end sales record: what sold, at what price, and the day's total."""
+    """Day-end record.
+
+    Note that total_sale and cash_in_hand are different numbers once credit
+    exists. Goods sold on udhaar count as revenue the moment they leave the
+    shop, but no cash arrived. A shopkeeper looking at a Rs 5,000 sale total
+    with Rs 2,000 in the drawer needs to see why.
+    """
     try:
         day = None
         if date:
@@ -683,8 +1028,7 @@ def daily_report(
         for txn, item in rows:
             amount = float(txn.total_amount or 0.0)
             record = {
-                "time": (txn.timestamp.replace(tzinfo=datetime.timezone.utc)
-                         .astimezone(PKT).strftime("%H:%M")),
+                "time": to_pkt(txn.timestamp).strftime("%H:%M"),
                 "item": item.name,
                 "qty": float(txn.quantity or 0.0),
                 "unit": item.unit,
@@ -698,7 +1042,31 @@ def daily_report(
                 purchases.append(record)
                 cost += amount
 
-        # Per-item roll-up so the shopkeeper sees what moved, not 40 lines.
+        # Khata movement for the same day.
+        khata_rows = (
+            db.query(models.KhataEntry, models.Customer)
+            .join(models.Customer,
+                  models.Customer.id == models.KhataEntry.customer_id)
+            .filter(models.KhataEntry.timestamp >= start,
+                    models.KhataEntry.timestamp < end)
+            .order_by(models.KhataEntry.timestamp).all())
+
+        credit_given = payments_received = 0.0
+        khata_lines = []
+        for entry, cust in khata_rows:
+            amount = float(entry.amount or 0.0)
+            if entry.type == 'udhaar':
+                credit_given += amount
+            else:
+                payments_received += amount
+            khata_lines.append({
+                "time": to_pkt(entry.timestamp).strftime("%H:%M"),
+                "customer": cust.name,
+                "type": entry.type,
+                "amount": amount,
+                "note": entry.note,
+            })
+
         by_item = {}
         for s in sales:
             b = by_item.setdefault(
@@ -712,10 +1080,16 @@ def daily_report(
             "total_sale": round(revenue, 2),
             "total_purchase": round(cost, 2),
             "sale_count": len(sales),
+            # Money actually collected: sales that were not on credit, plus
+            # any repayments that came in today.
+            "credit_given": round(credit_given, 2),
+            "payments_received": round(payments_received, 2),
+            "cash_in_hand": round(revenue - credit_given + payments_received, 2),
             "items_sold": sorted(by_item.values(),
                                  key=lambda x: x["amount"], reverse=True),
             "sales": sales,
             "purchases": purchases,
+            "khata": khata_lines,
         }
 
     except HTTPException:
@@ -755,7 +1129,7 @@ def range_report(
 
 
 # -------------------------------------------------------------------------
-# 5. UTILITY ENDPOINTS
+# 6. UTILITY ENDPOINTS
 # -------------------------------------------------------------------------
 @app.get("/inventory")
 def get_inventory(db: Session = Depends(get_db)):
@@ -778,12 +1152,7 @@ def get_inventory(db: Session = Depends(get_db)):
 @app.get("/items/{item_id}/transactions")
 def item_transactions(item_id: int, limit: int = Query(50, ge=1, le=500),
                       db: Session = Depends(get_db)):
-    """Movement history for one item, newest first.
-
-    The app's Item Detail screen currently reads this from its local Drift
-    database, which never sees voice sales or bill scans — so that history
-    shows empty. Point it here instead.
-    """
+    """Movement history for one item, newest first."""
     item = db.query(models.Item).filter(models.Item.id == item_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -802,8 +1171,7 @@ def item_transactions(item_id: int, limit: int = Query(50, ge=1, le=500),
             "quantity": float(r.quantity or 0.0),
             "unit_price": float(r.unit_price or 0.0),
             "amount": float(r.total_amount or 0.0),
-            "timestamp": (r.timestamp.replace(tzinfo=datetime.timezone.utc)
-                          .astimezone(PKT).isoformat()),
+            "timestamp": to_pkt(r.timestamp).isoformat(),
         } for r in rows],
     }
 
@@ -837,8 +1205,7 @@ class ItemFix(BaseModel):
 
 @app.put("/items/{item_id}")
 def fix_item(item_id: int, body: ItemFix, db: Session = Depends(get_db)):
-    """Correct an item the scanner got wrong — wrong unit, wrong quantity,
-    wrong price. Needed because a bad scan otherwise stays bad forever."""
+    """Correct an item the scanner got wrong — wrong unit, quantity, price."""
     item = db.query(models.Item).filter(models.Item.id == item_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
