@@ -1,13 +1,25 @@
 from sqlalchemy import (Column, Integer, String, Float, DateTime, ForeignKey,
-                        Index)
+                        Index, UniqueConstraint)
 from database import Base
 import datetime
 
 
 class Item(Base):
     __tablename__ = "items"
+    __table_args__ = (
+        # Names are unique PER SHOP, not globally. Every kiryana stocks
+        # sugar; a global unique index would let the first shop to scan a
+        # bill claim the name and break it for everyone else.
+        UniqueConstraint("owner_uid", "name", name="uq_item_owner_name"),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True, index=True)
+
+    # Firebase UID of the shopkeeper who owns this row. Nullable only so
+    # rows created before multi-tenancy can be migrated rather than lost.
+    owner_uid = Column(String, index=True, nullable=True)
+
+    name = Column(String, index=True)
     quantity = Column(Float, default=0.0)
     unit = Column(String, default="kg")
     min_stock = Column(Float, default=5.0)
@@ -22,6 +34,7 @@ class Item(Base):
 class StockTransaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True, index=True)
+    owner_uid = Column(String, index=True, nullable=True)
     item_id = Column(Integer, ForeignKey("items.id"))
     type = Column(String)  # 'in' or 'out'
     quantity = Column(Float)
@@ -42,8 +55,13 @@ class Customer(Base):
     the balance simply runs the other way. One table covers both.
     """
     __tablename__ = "customers"
+    __table_args__ = (
+        UniqueConstraint("owner_uid", "name", name="uq_customer_owner_name"),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True, index=True)
+    owner_uid = Column(String, index=True, nullable=True)
+    name = Column(String, index=True)
     phone = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
@@ -64,6 +82,7 @@ class KhataEntry(Base):
     """
     __tablename__ = "khata_entries"
     id = Column(Integer, primary_key=True, index=True)
+    owner_uid = Column(String, index=True, nullable=True)
     customer_id = Column(Integer, ForeignKey("customers.id"), index=True)
     type = Column(String)  # 'udhaar' or 'jama'
     amount = Column(Float, default=0.0)
@@ -77,3 +96,18 @@ class KhataEntry(Base):
 
 
 Index("ix_khata_customer_time", KhataEntry.customer_id, KhataEntry.timestamp)
+
+
+class Shop(Base):
+    """One row per signed-in shopkeeper, created on first authenticated call.
+
+    Keeps a readable name against the Firebase UID so the ledger and any
+    future admin view does not have to display raw UIDs.
+    """
+    __tablename__ = "shops"
+    id = Column(Integer, primary_key=True, index=True)
+    owner_uid = Column(String, unique=True, index=True)
+    phone = Column(String, nullable=True)
+    shop_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.datetime.utcnow)

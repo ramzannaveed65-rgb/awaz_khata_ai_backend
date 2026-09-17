@@ -9,7 +9,8 @@ import logging
 import traceback
 from dotenv import load_dotenv
 from google import genai
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Query
+from fastapi import (FastAPI, Depends, HTTPException, File, UploadFile,
+                     Query, Header)
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -33,6 +34,99 @@ Base.metadata.create_all(bind=engine)
 PKT = datetime.timezone(datetime.timedelta(hours=5))
 
 
+# -------------------------------------------------------------------------
+# AUTHENTICATION
+# -------------------------------------------------------------------------
+# Every row belongs to a shop, identified by the Firebase UID of whoever
+# signed in. Without this the API was wide open: anyone who knew the URL
+# could read, alter or delete any shop's inventory and ledger.
+import firebase_admin
+from firebase_admin import auth as fb_auth, credentials as fb_credentials
+
+_firebase_ready = False
+
+
+def _init_firebase():
+    """Set up the Admin SDK from a service-account key.
+
+    The key is a secret and never belongs in the repo. Put the whole JSON
+    into the FIREBASE_CREDENTIALS environment variable on Railway.
+    """
+    global _firebase_ready
+    if _firebase_ready or firebase_admin._apps:
+        _firebase_ready = True
+        return
+
+    raw = os.getenv("FIREBASE_CREDENTIALS")
+    if not raw:
+        log.error("FIREBASE_CREDENTIALS is not set — every request will be "
+                  "rejected until it is.")
+        return
+
+    try:
+        cred = fb_credentials.Certificate(json.loads(raw))
+        firebase_admin.initialize_app(cred)
+        _firebase_ready = True
+        log.info("firebase admin initialised")
+    except Exception as e:
+        # Deliberately not falling back to "allow everything". A broken
+        # key must fail closed, not open.
+        log.error("firebase admin failed to initialise: %s", e)
+
+
+_init_firebase()
+
+
+def get_uid(authorization: str | None = Header(None)) -> str:
+    """FastAPI dependency: turns an Authorization header into a Firebase UID.
+
+    Raises 401 for anything it cannot verify, so an endpoint that depends on
+    this can never run for an unauthenticated caller.
+    """
+    if not _firebase_ready:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is not configured on the server.")
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Sign in required")
+
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        decoded = fb_auth.verify_id_token(token)
+    except fb_auth.ExpiredIdTokenError:
+        raise HTTPException(status_code=401,
+                            detail="Session expired. Please sign in again.")
+    except fb_auth.RevokedIdTokenError:
+        raise HTTPException(status_code=401,
+                            detail="Session revoked. Please sign in again.")
+    except Exception as e:
+        log.warning("token rejected: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    return uid
+
+
+def touch_shop(db, uid, phone=None):
+    """Records the shop on first sight and keeps last_seen current."""
+    shop = db.query(models.Shop).filter(models.Shop.owner_uid == uid).first()
+    if not shop:
+        shop = models.Shop(owner_uid=uid, phone=phone)
+        db.add(shop)
+        db.commit()
+        log.info("shop: registered new owner %s", uid)
+    return shop
+
+
+def owned(db, model, uid):
+    """Base query scoped to one shop. Every read must go through this."""
+    return db.query(model).filter(model.owner_uid == uid)
+
+
+
 def _add_column_if_missing(inspector, table, column, ddl_type):
     """create_all() makes missing TABLES but never adds a column to a table
     that already exists. This fills that gap. Safe to run on every boot."""
@@ -47,6 +141,46 @@ def _add_column_if_missing(inspector, table, column, ddl_type):
     log.info("schema: added %s.%s", table, column)
 
 
+def _drop_global_unique(inspector, table, column):
+    """Remove a single-column unique index so a composite one can replace it.
+
+    items.name and customers.name were globally unique. Once every shop has
+    its own inventory that is wrong: the first shop to add "Sugar" would
+    stop every other shop from adding it. The name only has to be unique
+    within one owner.
+    """
+    if not inspector.has_table(table):
+        return
+    for idx in inspector.get_indexes(table):
+        if idx.get("unique") and idx.get("column_names") == [column]:
+            with engine.begin() as conn:
+                conn.execute(text(f'DROP INDEX IF EXISTS "{idx["name"]}"'))
+            log.info("schema: dropped global unique index %s", idx["name"])
+    for con in inspector.get_unique_constraints(table):
+        if con.get("column_names") == [column]:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f'ALTER TABLE {table} DROP CONSTRAINT IF EXISTS '
+                    f'"{con["name"]}"'))
+            log.info("schema: dropped unique constraint %s", con["name"])
+
+
+def _add_composite_unique(table, name, columns):
+    existing = {c["name"] for c in inspect(engine).get_unique_constraints(table)}
+    if name in existing:
+        return
+    cols = ", ".join(columns)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"ALTER TABLE {table} ADD CONSTRAINT {name} UNIQUE ({cols})"))
+        log.info("schema: added %s on %s", name, table)
+    except Exception as e:
+        # Duplicates across the same owner would block this. Not fatal —
+        # the app still works, it just cannot enforce the rule yet.
+        log.warning("schema: could not add %s: %s", name, e)
+
+
 def ensure_schema():
     inspector = inspect(engine)
     _add_column_if_missing(inspector, "items", "sale_price", "FLOAT DEFAULT 0.0")
@@ -55,6 +189,40 @@ def ensure_schema():
                            "FLOAT DEFAULT 0.0")
     _add_column_if_missing(inspector, "transactions", "total_amount",
                            "FLOAT DEFAULT 0.0")
+
+    # Multi-tenancy: every table gains an owner.
+    for table in ("items", "transactions", "customers", "khata_entries"):
+        _add_column_if_missing(inspector, table, "owner_uid", "VARCHAR")
+
+    inspector = inspect(engine)
+    _drop_global_unique(inspector, "items", "name")
+    _drop_global_unique(inspector, "customers", "name")
+    _add_composite_unique("items", "uq_item_owner_name",
+                          ["owner_uid", "name"])
+    _add_composite_unique("customers", "uq_customer_owner_name",
+                          ["owner_uid", "name"])
+
+    _claim_orphan_rows()
+
+
+def _claim_orphan_rows():
+    """Assign pre-multi-tenancy rows to one owner.
+
+    Rows written before this change have no owner, so they are invisible to
+    everyone. Set SEED_OWNER_UID to the Firebase UID that should inherit
+    them; leave it unset and they simply stay hidden.
+    """
+    seed = os.getenv("SEED_OWNER_UID")
+    if not seed:
+        return
+    with engine.begin() as conn:
+        for table in ("items", "transactions", "customers", "khata_entries"):
+            result = conn.execute(text(
+                f"UPDATE {table} SET owner_uid = :uid WHERE owner_uid IS NULL"),
+                {"uid": seed})
+            if result.rowcount:
+                log.info("schema: claimed %s orphan rows in %s",
+                         result.rowcount, table)
 
 
 ensure_schema()
@@ -112,7 +280,7 @@ def _squash(s):
     return re.sub(r'(.)\1+', r'\1', _norm(s).replace(' ', ''))
 
 
-def find_by_name(db, model, name, allow_partial=False,
+def find_by_name(db, model, name, uid, allow_partial=False,
                  cutoff=FUZZY_CUTOFF_VOICE):
     """
     Look up a row by name, tolerating the spelling drift that comes from
@@ -134,11 +302,11 @@ def find_by_name(db, model, name, allow_partial=False,
 
     query = name.strip()
 
-    item = db.query(model).filter(model.name.ilike(query)).first()
+    item = owned(db, model, uid).filter(model.name.ilike(query)).first()
     if item:
         return item
 
-    all_rows = db.query(model).all()
+    all_rows = owned(db, model, uid).all()
     if not all_rows:
         return None
 
@@ -169,18 +337,19 @@ def find_by_name(db, model, name, allow_partial=False,
     return None
 
 
-def find_item(db, name, allow_partial=False, cutoff=FUZZY_CUTOFF_VOICE):
-    return find_by_name(db, models.Item, name, allow_partial, cutoff)
+def find_item(db, name, uid, allow_partial=False,
+              cutoff=FUZZY_CUTOFF_VOICE):
+    return find_by_name(db, models.Item, name, uid, allow_partial, cutoff)
 
 
-def find_customer(db, name, allow_partial=True):
-    return find_by_name(db, models.Customer, name, allow_partial,
+def find_customer(db, name, uid, allow_partial=True):
+    return find_by_name(db, models.Customer, name, uid, allow_partial,
                         FUZZY_CUTOFF_CUSTOMER)
 
 
-def customer_balance(db, customer_id):
+def customer_balance(db, customer_id, uid):
     """Positive = customer owes the shop. Negative = the shop owes them."""
-    rows = db.query(models.KhataEntry).filter(
+    rows = owned(db, models.KhataEntry, uid).filter(
         models.KhataEntry.customer_id == customer_id).all()
     udhaar = sum(r.amount or 0.0 for r in rows if r.type == 'udhaar')
     jama = sum(r.amount or 0.0 for r in rows if r.type == 'jama')
@@ -464,8 +633,11 @@ def health():
 # 2. AI BILL SCANNER — purchases (stock IN)
 # -------------------------------------------------------------------------
 @app.post("/stock/scan-bill")
-async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def scan_bill(file: UploadFile = File(...),
+                    db: Session = Depends(get_db),
+                    uid: str = Depends(get_uid)):
     try:
+        touch_shop(db, uid)
         request_object_content = await file.read()
         image = prepare_image(request_object_content)
 
@@ -524,11 +696,12 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
 
             # Strict matching: a wrong merge on a scan is worse than a
             # duplicate row, because it silently inflates someone's stock.
-            db_item = find_item(db, item_name, allow_partial=False,
+            db_item = find_item(db, item_name, uid, allow_partial=False,
                                 cutoff=FUZZY_CUTOFF_SCAN)
 
             if not db_item:
-                db_item = models.Item(name=item_name, quantity=0.0, unit=unit)
+                db_item = models.Item(owner_uid=uid, name=item_name,
+                                      quantity=0.0, unit=unit)
                 db.add(db_item)
                 db.flush()
 
@@ -539,6 +712,7 @@ async def scan_bill(file: UploadFile = File(...), db: Session = Depends(get_db))
 
             db_item.quantity += qty
             db.add(models.StockTransaction(
+                owner_uid=uid,
                 item_id=db_item.id,
                 type="in",
                 quantity=qty,
@@ -583,9 +757,11 @@ VOICE_WRITE_ACTIONS = ("STOCK_IN", "STOCK_OUT", "KHATA_UDHAAR", "KHATA_JAMA")
 
 
 @app.post("/voice/process")
-async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
+async def process_voice(data: VoiceInput, db: Session = Depends(get_db),
+                        uid: str = Depends(get_uid)):
+    touch_shop(db, uid)
     if data.confirm:
-        return execute_actions(data.actions or [], db)
+        return execute_actions(data.actions or [], db, uid)
 
     prompt = f"""
     You are AwazKhata AI. Convert this command into JSON: "{data.transcript}"
@@ -665,7 +841,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
             qty = to_float(a.get("qty"))
 
             if action == "QUERY":
-                db_item = find_item(db, item_name, allow_partial=True)
+                db_item = find_item(db, item_name, uid, allow_partial=True)
                 if db_item:
                     a["item"] = db_item.name
                     a["voice_response"] = (
@@ -677,7 +853,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
 
             elif action == "SUMMARY":
                 start, end, day = pkt_day_bounds()
-                sales = db.query(models.StockTransaction).filter(
+                sales = owned(db, models.StockTransaction, uid).filter(
                     models.StockTransaction.type == 'out',
                     models.StockTransaction.timestamp >= start,
                     models.StockTransaction.timestamp < end,
@@ -692,13 +868,13 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                 )
 
             elif action == "KHATA_BALANCE":
-                cust = find_customer(db, customer_name)
+                cust = find_customer(db, customer_name, uid)
                 if not cust:
                     a["voice_response"] = (
                         f"{customer_name} ka koi khata nahi hai.")
                 else:
                     a["customer"] = cust.name
-                    bal = customer_balance(db, cust.id)
+                    bal = customer_balance(db, cust.id, uid)
                     a["balance"] = bal
                     if bal > 0:
                         a["voice_response"] = (
@@ -715,12 +891,12 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                     a["warning"] = "Kis ka khata? Naam nahi samjha."
                     continue
 
-                cust = find_customer(db, customer_name)
+                cust = find_customer(db, customer_name, uid)
                 if cust:
                     if cust.name != customer_name:
                         a["matched_from"] = customer_name
                     a["customer"] = cust.name
-                    a["current_balance"] = customer_balance(db, cust.id)
+                    a["current_balance"] = customer_balance(db, cust.id, uid)
                 else:
                     # Not an error — a new khata gets opened on confirm.
                     # But say so, because a mis-heard name should not
@@ -729,7 +905,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                     a["current_balance"] = 0.0
 
                 if action == "KHATA_UDHAAR" and item_name:
-                    db_item = find_item(db, item_name, allow_partial=True)
+                    db_item = find_item(db, item_name, uid, allow_partial=True)
                     if not db_item:
                         a["warning"] = f"{item_name} stock mein nahi hai."
                     else:
@@ -755,7 +931,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                         a["warning"] = "Kitne rupay? Amount nahi samjha."
 
             elif action in ("STOCK_IN", "STOCK_OUT"):
-                db_item = find_item(db, item_name, allow_partial=True)
+                db_item = find_item(db, item_name, uid, allow_partial=True)
 
                 # THE KEY STEP: rewrite the name to the one actually stored,
                 # so the confirm phase looks up an exact match.
@@ -799,7 +975,7 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db)):
                             detail="Failed to process voice intent")
 
 
-def execute_actions(actions, db):
+def execute_actions(actions, db, uid):
     """Commits confirmed write actions. All-or-nothing."""
     results = []
     sale_total = 0.0
@@ -810,7 +986,7 @@ def execute_actions(actions, db):
                 continue
 
             if action in ("KHATA_UDHAAR", "KHATA_JAMA"):
-                line, credited = _commit_khata(a, db)
+                line, credited = _commit_khata(a, db, uid)
                 results.append(line)
                 sale_total += credited
                 continue
@@ -820,13 +996,14 @@ def execute_actions(actions, db):
             if qty <= 0:
                 raise ValueError(f"Invalid quantity for {item_name}")
 
-            db_item = find_item(db, item_name, allow_partial=True)
+            db_item = find_item(db, item_name, uid, allow_partial=True)
 
             if not db_item:
                 if action == "STOCK_OUT":
                     raise ValueError(f"{item_name} stock mein nahi hai")
                 db_item = models.Item(
-                    name=item_name, quantity=0.0, unit=a.get("unit", "pcs"))
+                    owner_uid=uid, name=item_name, quantity=0.0,
+                    unit=a.get("unit", "pcs"))
                 db.add(db_item)
                 db.flush()
 
@@ -861,6 +1038,7 @@ def execute_actions(actions, db):
             line_total = round(qty * rate, 2)
 
             db.add(models.StockTransaction(
+                owner_uid=uid,
                 item_id=db_item.id,
                 type=action.lower().replace("stock_", ""),
                 quantity=qty,
@@ -892,7 +1070,7 @@ def execute_actions(actions, db):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-def _commit_khata(a, db):
+def _commit_khata(a, db, uid):
     """Writes one khata entry. Returns (summary line, revenue recognised).
 
     Goods given on credit are a SALE — stock leaves and the shop has earned
@@ -905,9 +1083,9 @@ def _commit_khata(a, db):
     if not customer_name:
         raise ValueError("Customer ka naam nahi mila")
 
-    cust = find_customer(db, customer_name)
+    cust = find_customer(db, customer_name, uid)
     if not cust:
-        cust = models.Customer(name=customer_name)
+        cust = models.Customer(owner_uid=uid, name=customer_name)
         db.add(cust)
         db.flush()
         log.info("khata: opened new account for %r", customer_name)
@@ -923,18 +1101,20 @@ def _commit_khata(a, db):
             raise ValueError("Amount zero hai")
 
         db.add(models.KhataEntry(
+            owner_uid=uid,
             customer_id=cust.id,
             type='jama' if action == "KHATA_JAMA" else 'udhaar',
             amount=amount,
             note=a.get("note"),
         ))
-        bal = customer_balance(db, cust.id)
+        db.flush()
+        bal = customer_balance(db, cust.id, uid)
         verb = "paid" if action == "KHATA_JAMA" else "took"
         return (f"{cust.name} {verb} Rs {amount:,.0f} "
                 f"(balance Rs {bal:,.0f})"), revenue
 
     # --- goods on credit ---
-    db_item = find_item(db, item_name, allow_partial=True)
+    db_item = find_item(db, item_name, uid, allow_partial=True)
     if not db_item:
         raise ValueError(f"{item_name} stock mein nahi hai")
 
@@ -959,6 +1139,7 @@ def _commit_khata(a, db):
 
     db_item.quantity -= qty
     db.add(models.StockTransaction(
+        owner_uid=uid,
         item_id=db_item.id,
         type="out",
         quantity=qty,
@@ -966,6 +1147,7 @@ def _commit_khata(a, db):
         total_amount=line_total,
     ))
     db.add(models.KhataEntry(
+        owner_uid=uid,
         customer_id=cust.id,
         type='udhaar',
         amount=line_total,
@@ -976,7 +1158,8 @@ def _commit_khata(a, db):
     ))
     revenue = line_total
 
-    bal = customer_balance(db, cust.id)
+    db.flush()
+    bal = customer_balance(db, cust.id, uid)
     return (f"{cust.name} took {qty:g} {db_item.unit} {db_item.name} "
             f"on credit — Rs {line_total:,.0f} (balance Rs {bal:,.0f})"), revenue
 
@@ -996,14 +1179,15 @@ class EntryIn(BaseModel):
 
 
 @app.get("/khata/customers")
-def list_customers(db: Session = Depends(get_db)):
+def list_customers(db: Session = Depends(get_db),
+                   uid: str = Depends(get_uid)):
     """Everyone with an account, and what each one owes.
 
     Sorted by who owes most, because that is the list a shopkeeper
     actually wants to look at.
     """
-    customers = db.query(models.Customer).all()
-    entries = db.query(models.KhataEntry).all()
+    customers = owned(db, models.Customer, uid).all()
+    entries = owned(db, models.KhataEntry, uid).all()
 
     totals = {}
     last_seen = {}
@@ -1041,18 +1225,19 @@ def list_customers(db: Session = Depends(get_db)):
 
 
 @app.post("/khata/customers")
-def add_customer(body: CustomerIn, db: Session = Depends(get_db)):
+def add_customer(body: CustomerIn, db: Session = Depends(get_db),
+                 uid: str = Depends(get_uid)):
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name is required")
 
-    existing = find_customer(db, name, allow_partial=False)
+    existing = find_customer(db, name, uid, allow_partial=False)
     if existing:
         raise HTTPException(
             status_code=409,
             detail=f"{existing.name} already has a khata")
 
-    cust = models.Customer(name=name, phone=body.phone)
+    cust = models.Customer(owner_uid=uid, name=name, phone=body.phone)
     db.add(cust)
     db.commit()
     return {"status": "success", "id": cust.id, "name": cust.name,
@@ -1060,15 +1245,16 @@ def add_customer(body: CustomerIn, db: Session = Depends(get_db)):
 
 
 @app.get("/khata/customers/{customer_id}")
-def customer_detail(customer_id: int, db: Session = Depends(get_db)):
+def customer_detail(customer_id: int, db: Session = Depends(get_db),
+                    uid: str = Depends(get_uid)):
     """One customer's full ledger, newest entry first, with a running
     balance so the shopkeeper can see how it got to where it is."""
-    cust = db.query(models.Customer).filter(
+    cust = owned(db, models.Customer, uid).filter(
         models.Customer.id == customer_id).first()
     if not cust:
         raise HTTPException(status_code=404, detail="Customer not found")
 
-    rows = (db.query(models.KhataEntry)
+    rows = (owned(db, models.KhataEntry, uid)
             .filter(models.KhataEntry.customer_id == customer_id)
             .order_by(models.KhataEntry.timestamp).all())
 
@@ -1101,9 +1287,11 @@ def customer_detail(customer_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/khata/customers/{customer_id}/entries")
-def add_entry(customer_id: int, body: EntryIn, db: Session = Depends(get_db)):
+def add_entry(customer_id: int, body: EntryIn,
+              db: Session = Depends(get_db),
+              uid: str = Depends(get_uid)):
     """Manual ledger entry — cash lent or repaid, no stock involved."""
-    cust = db.query(models.Customer).filter(
+    cust = owned(db, models.Customer, uid).filter(
         models.Customer.id == customer_id).first()
     if not cust:
         raise HTTPException(status_code=404, detail="Customer not found")
@@ -1117,6 +1305,7 @@ def add_entry(customer_id: int, body: EntryIn, db: Session = Depends(get_db)):
                             detail="Amount must be greater than zero")
 
     db.add(models.KhataEntry(
+        owner_uid=uid,
         customer_id=cust.id,
         type=entry_type,
         amount=body.amount,
@@ -1125,15 +1314,16 @@ def add_entry(customer_id: int, body: EntryIn, db: Session = Depends(get_db)):
     db.commit()
 
     return {"status": "success", "customer": cust.name,
-            "balance": customer_balance(db, cust.id)}
+            "balance": customer_balance(db, cust.id, uid)}
 
 
 @app.delete("/khata/entries/{entry_id}")
-def delete_entry(entry_id: int, db: Session = Depends(get_db)):
+def delete_entry(entry_id: int, db: Session = Depends(get_db),
+                 uid: str = Depends(get_uid)):
     """Removes a ledger line. Does NOT restore stock — if goods went out on
     a mistaken entry, correct the stock separately so the two decisions stay
     visible rather than one silently undoing the other."""
-    entry = db.query(models.KhataEntry).filter(
+    entry = owned(db, models.KhataEntry, uid).filter(
         models.KhataEntry.id == entry_id).first()
     if not entry:
         raise HTTPException(status_code=404, detail="Entry not found")
@@ -1145,7 +1335,7 @@ def delete_entry(entry_id: int, db: Session = Depends(get_db)):
 
     return {
         "status": "success",
-        "balance": customer_balance(db, customer_id),
+        "balance": customer_balance(db, customer_id, uid),
         "stock_unchanged": had_stock,
     }
 
@@ -1157,6 +1347,7 @@ def delete_entry(entry_id: int, db: Session = Depends(get_db)):
 def daily_report(
     date: str | None = Query(None, description="YYYY-MM-DD, defaults to today"),
     db: Session = Depends(get_db),
+    uid: str = Depends(get_uid),
 ):
     """Day-end record.
 
@@ -1179,7 +1370,8 @@ def daily_report(
         rows = (
             db.query(models.StockTransaction, models.Item)
             .join(models.Item, models.Item.id == models.StockTransaction.item_id)
-            .filter(models.StockTransaction.timestamp >= start,
+            .filter(models.StockTransaction.owner_uid == uid,
+                    models.StockTransaction.timestamp >= start,
                     models.StockTransaction.timestamp < end)
             .order_by(models.StockTransaction.timestamp)
             .all()
@@ -1210,7 +1402,8 @@ def daily_report(
             db.query(models.KhataEntry, models.Customer)
             .join(models.Customer,
                   models.Customer.id == models.KhataEntry.customer_id)
-            .filter(models.KhataEntry.timestamp >= start,
+            .filter(models.KhataEntry.owner_uid == uid,
+                    models.KhataEntry.timestamp >= start,
                     models.KhataEntry.timestamp < end)
             .order_by(models.KhataEntry.timestamp).all())
 
@@ -1267,6 +1460,7 @@ def daily_report(
 def range_report(
     days: int = Query(7, ge=1, le=90, description="How many days back"),
     db: Session = Depends(get_db),
+    uid: str = Depends(get_uid),
 ):
     """Sale totals per day, newest first. For a weekly/monthly chart."""
     try:
@@ -1275,7 +1469,7 @@ def range_report(
         for i in range(days):
             day = today - datetime.timedelta(days=i)
             start, end, _ = pkt_day_bounds(day)
-            rows = db.query(models.StockTransaction).filter(
+            rows = owned(db, models.StockTransaction, uid).filter(
                 models.StockTransaction.type == 'out',
                 models.StockTransaction.timestamp >= start,
                 models.StockTransaction.timestamp < end,
@@ -1295,9 +1489,10 @@ def range_report(
 # 6. UTILITY ENDPOINTS
 # -------------------------------------------------------------------------
 @app.get("/inventory")
-def get_inventory(db: Session = Depends(get_db)):
+def get_inventory(db: Session = Depends(get_db),
+                  uid: str = Depends(get_uid)):
     try:
-        items = db.query(models.Item).all()
+        items = owned(db, models.Item, uid).all()
         return [{
             "id": i.id,
             "name": i.name,
@@ -1314,13 +1509,15 @@ def get_inventory(db: Session = Depends(get_db)):
 
 @app.get("/items/{item_id}/transactions")
 def item_transactions(item_id: int, limit: int = Query(50, ge=1, le=500),
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db),
+                      uid: str = Depends(get_uid)):
     """Movement history for one item, newest first."""
-    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    item = owned(db, models.Item, uid).filter(
+        models.Item.id == item_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    rows = (db.query(models.StockTransaction)
+    rows = (owned(db, models.StockTransaction, uid)
             .filter(models.StockTransaction.item_id == item_id)
             .order_by(models.StockTransaction.timestamp.desc())
             .limit(limit).all())
@@ -1345,10 +1542,12 @@ class PriceUpdate(BaseModel):
 
 @app.put("/items/{item_id}/price")
 def set_sale_price(item_id: int, body: PriceUpdate,
-                   db: Session = Depends(get_db)):
+                   db: Session = Depends(get_db),
+                   uid: str = Depends(get_uid)):
     """Lets the shopkeeper set a selling price that differs from what the
     purchase bill said. Without this, every sale records at cost."""
-    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    item = owned(db, models.Item, uid).filter(
+        models.Item.id == item_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
     if body.sale_price < 0:
@@ -1367,9 +1566,11 @@ class ItemFix(BaseModel):
 
 
 @app.put("/items/{item_id}")
-def fix_item(item_id: int, body: ItemFix, db: Session = Depends(get_db)):
+def fix_item(item_id: int, body: ItemFix, db: Session = Depends(get_db),
+             uid: str = Depends(get_uid)):
     """Correct an item the scanner got wrong — wrong unit, quantity, price."""
-    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    item = owned(db, models.Item, uid).filter(
+        models.Item.id == item_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
