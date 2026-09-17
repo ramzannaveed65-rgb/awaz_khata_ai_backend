@@ -193,6 +193,7 @@ def ensure_schema():
     # Multi-tenancy: every table gains an owner.
     for table in ("items", "transactions", "customers", "khata_entries"):
         _add_column_if_missing(inspector, table, "owner_uid", "VARCHAR")
+    _add_column_if_missing(inspector, "transactions", "note", "VARCHAR")
 
     inspector = inspect(engine)
     _drop_global_unique(inspector, "items", "name")
@@ -1531,8 +1532,82 @@ def item_transactions(item_id: int, limit: int = Query(50, ge=1, le=500),
             "quantity": float(r.quantity or 0.0),
             "unit_price": float(r.unit_price or 0.0),
             "amount": float(r.total_amount or 0.0),
+            "note": r.note,
             "timestamp": to_pkt(r.timestamp).isoformat(),
         } for r in rows],
+    }
+
+
+class StockMove(BaseModel):
+    type: str                 # 'in' or 'out'
+    quantity: float
+    unit_price: float | None = None
+    note: str | None = None
+
+
+@app.post("/items/{item_id}/stock")
+def move_stock(item_id: int, body: StockMove,
+               db: Session = Depends(get_db),
+               uid: str = Depends(get_uid)):
+    """Manual stock in/out from the item screen.
+
+    The voice path already did this, but only through a parsed intent. A
+    shopkeeper tapping STOCK OUT needs the same write, and it has to land on
+    the server — a movement recorded only on the phone never shows up in the
+    day's sales or in the item's history.
+    """
+    item = owned(db, models.Item, uid).filter(
+        models.Item.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    move_type = (body.type or "").strip().lower()
+    if move_type not in ("in", "out"):
+        raise HTTPException(status_code=400,
+                            detail="type must be 'in' or 'out'")
+
+    qty = to_float(body.quantity)
+    if qty <= 0:
+        raise HTTPException(status_code=400,
+                            detail="Quantity must be greater than zero")
+
+    if move_type == "out" and item.quantity < qty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only {item.quantity:g} {item.unit} {item.name} in stock")
+
+    # A stated price updates the item; otherwise use what is already stored.
+    stated = to_float(body.unit_price) if body.unit_price is not None else 0.0
+    if move_type == "in":
+        rate = stated or float(item.cost_price or 0.0)
+        if stated > 0:
+            item.cost_price = stated
+        item.quantity += qty
+    else:
+        rate = stated or float(item.sale_price or 0.0)
+        if stated > 0:
+            item.sale_price = stated
+        item.quantity -= qty
+
+    db.add(models.StockTransaction(
+        owner_uid=uid,
+        item_id=item.id,
+        type=move_type,
+        quantity=qty,
+        unit_price=rate,
+        total_amount=round(qty * rate, 2),
+        note=body.note,
+    ))
+    db.commit()
+
+    return {
+        "status": "success",
+        "id": item.id,
+        "name": item.name,
+        "unit": item.unit,
+        "quantity": float(item.quantity),
+        "unit_price": rate,
+        "amount": round(qty * rate, 2),
     }
 
 

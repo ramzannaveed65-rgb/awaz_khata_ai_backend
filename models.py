@@ -45,6 +45,10 @@ class StockTransaction(Base):
     unit_price = Column(Float, default=0.0)
     total_amount = Column(Float, default=0.0)
 
+    # Free text the shopkeeper attaches to a manual movement — "wastage",
+    # "returned to supplier", a customer name. Null for voice and scans.
+    note = Column(String, nullable=True)
+
     timestamp = Column(DateTime, default=datetime.datetime.utcnow, index=True)
 
 
