@@ -1341,6 +1341,88 @@ def delete_entry(entry_id: int, db: Session = Depends(get_db),
     }
 
 
+class CreditSale(BaseModel):
+    item_id: int
+    quantity: float
+    unit_price: float | None = None
+    note: str | None = None
+
+
+@app.post("/khata/customers/{customer_id}/credit-sale")
+def credit_sale(customer_id: int, body: CreditSale,
+                db: Session = Depends(get_db),
+                uid: str = Depends(get_uid)):
+    """Goods handed over on credit: stock leaves AND the customer owes.
+
+    Both writes belong to one decision, so they commit together. Recording
+    the sale without the ledger entry loses the debt; recording the debt
+    without the stock movement leaves phantom inventory.
+    """
+    cust = owned(db, models.Customer, uid).filter(
+        models.Customer.id == customer_id).first()
+    if not cust:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    item = owned(db, models.Item, uid).filter(
+        models.Item.id == body.item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    qty = to_float(body.quantity)
+    if qty <= 0:
+        raise HTTPException(status_code=400,
+                            detail="Quantity must be greater than zero")
+    if item.quantity < qty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only {item.quantity:g} {item.unit} {item.name} in stock")
+
+    stated = to_float(body.unit_price) if body.unit_price is not None else 0.0
+    rate = stated or float(item.sale_price or 0.0)
+    if rate <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No selling price set for {item.name}")
+    if stated > 0:
+        item.sale_price = stated
+
+    line_total = round(qty * rate, 2)
+    item.quantity -= qty
+
+    db.add(models.StockTransaction(
+        owner_uid=uid,
+        item_id=item.id,
+        type="out",
+        quantity=qty,
+        unit_price=rate,
+        total_amount=line_total,
+        note=body.note or f"Udhaar: {cust.name}",
+    ))
+    db.add(models.KhataEntry(
+        owner_uid=uid,
+        customer_id=cust.id,
+        type='udhaar',
+        amount=line_total,
+        item_id=item.id,
+        quantity=qty,
+        unit_price=rate,
+        note=body.note or f"{qty:g} {item.unit} {item.name}",
+    ))
+    db.commit()
+
+    return {
+        "status": "success",
+        "customer": cust.name,
+        "item": item.name,
+        "quantity": qty,
+        "unit": item.unit,
+        "unit_price": rate,
+        "amount": line_total,
+        "remaining_stock": float(item.quantity),
+        "balance": customer_balance(db, cust.id, uid),
+    }
+
+
 # -------------------------------------------------------------------------
 # 5. REPORTS
 # -------------------------------------------------------------------------
