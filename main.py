@@ -1620,6 +1620,53 @@ def item_transactions(item_id: int, limit: int = Query(50, ge=1, le=500),
     }
 
 
+@app.delete("/items/{item_id}")
+def delete_item(item_id: int, force: bool = Query(False),
+                db: Session = Depends(get_db),
+                uid: str = Depends(get_uid)):
+    """Remove an item.
+
+    Refuses by default when the item has movement history, because deleting
+    it takes those sales out of every past report — a day that showed
+    Rs 4,000 would silently become Rs 3,200. Pass force=true to accept that.
+
+    An item referenced by a khata entry is never deletable: the customer's
+    debt would lose the record of what it was for.
+    """
+    item = owned(db, models.Item, uid).filter(
+        models.Item.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    khata_uses = owned(db, models.KhataEntry, uid).filter(
+        models.KhataEntry.item_id == item_id).count()
+    if khata_uses:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item.name} appears in {khata_uses} khata entries. "
+                   "Rename it instead of deleting it.")
+
+    txn_count = owned(db, models.StockTransaction, uid).filter(
+        models.StockTransaction.item_id == item_id).count()
+
+    if txn_count and not force:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item.name} has {txn_count} recorded movements. "
+                   "Deleting it will change past sales reports. "
+                   "Rename it, or delete with force=true.")
+
+    name = item.name
+    owned(db, models.StockTransaction, uid).filter(
+        models.StockTransaction.item_id == item_id).delete()
+    db.delete(item)
+    db.commit()
+
+    log.info("item: deleted %r (%s movements removed)", name, txn_count)
+    return {"status": "success", "deleted": name,
+            "transactions_removed": txn_count}
+
+
 class StockMove(BaseModel):
     type: str                 # 'in' or 'out'
     quantity: float
@@ -1716,8 +1763,10 @@ def set_sale_price(item_id: int, body: PriceUpdate,
 
 
 class ItemFix(BaseModel):
+    name: str | None = None
     quantity: float | None = None
     unit: str | None = None
+    min_stock: float | None = None
     cost_price: float | None = None
     sale_price: float | None = None
 
@@ -1731,6 +1780,22 @@ def fix_item(item_id: int, body: ItemFix, db: Session = Depends(get_db),
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
+    if body.name is not None:
+        new_name = body.name.strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Name cannot be empty")
+        # The scanner sometimes folds a quantity into the name ("Soap 4"),
+        # which then never matches what anyone says out loud. Renaming has
+        # to check the new name is free within THIS shop.
+        clash = (owned(db, models.Item, uid)
+                 .filter(models.Item.name.ilike(new_name),
+                         models.Item.id != item.id).first())
+        if clash:
+            raise HTTPException(
+                status_code=409,
+                detail=f"You already have an item called {clash.name}")
+        item.name = new_name
+
     if body.quantity is not None:
         if body.quantity < 0:
             raise HTTPException(status_code=400,
@@ -1738,6 +1803,8 @@ def fix_item(item_id: int, body: ItemFix, db: Session = Depends(get_db),
         item.quantity = body.quantity
     if body.unit:
         item.unit = body.unit
+    if body.min_stock is not None:
+        item.min_stock = body.min_stock
     if body.cost_price is not None:
         item.cost_price = body.cost_price
     if body.sale_price is not None:
