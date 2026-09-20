@@ -467,6 +467,41 @@ def convert_qty(qty, spoken_unit, stored_unit, item_name):
     return None, (f"{spoken_unit} ko {stored_unit} mein badla nahi ja sakta.")
 
 
+def qty_from_amount(a, db_item, qty, rate):
+    """Turn "100 rupay ki chini" into a quantity.
+
+    Shopkeepers sell by value as often as by weight — a customer asks for
+    fifty rupees of sugar, not for 270 grams. The command carries a money
+    amount and no quantity, so the server divides by the selling price.
+
+    Returns (qty, rate) or (None, rate) when it cannot be worked out.
+    """
+    if qty > 0:
+        return qty, rate
+
+    money = to_float(a.get("amount"))
+    if money <= 0:
+        return None, rate
+
+    if rate <= 0:
+        a["warning"] = f"{db_item.name} ka rate set nahi hai."
+        return None, rate
+
+    computed = round(money / rate, 3)
+    if computed <= 0:
+        a["warning"] = f"{money:,.0f} rupay mein {db_item.name} nahi aata."
+        return None, rate
+
+    log.info("value-sale: Rs %s of %r at %s = %s %s",
+             money, db_item.name, rate, computed, db_item.unit)
+    a["qty"] = computed
+    a["unit"] = db_item.unit
+    a["by_amount"] = money
+    a["unit_note"] = (f"Rs {money:,.0f} ka {db_item.name} = "
+                      f"{computed:g} {db_item.unit}")
+    return computed, rate
+
+
 def resolve_qty(a, db_item, qty):
     """Convert a spoken quantity for an item, recording what happened on the
     action so the app can show it and the confirm phase reuses it."""
@@ -780,6 +815,15 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db),
     "100 gram chai" is qty=100 unit="gm". The server knows how the stock
     is held and converts.
 
+    SELLING BY VALUE: the user may ask for an amount of MONEY rather than a
+    quantity — "100 ke chini bech di", "50 rupay ka namak", "200 ka ghee".
+    That is NOT a quantity. Set qty=0, leave unit empty, and put the money
+    in "amount". The server divides by the price to get the quantity.
+    "100 ke chini bech di" ->
+      {{"action":"STOCK_OUT","item":"Sugar","qty":0,"unit":"",
+        "amount":100,"price":0,
+        "voice_response":"100 rupay ki cheeni bech di."}}
+
     Translation Mapping:
     - Namak -> Salt, Chini/Shakar -> Sugar, Pani -> Water, Dudh -> Milk, Atta -> Flour.
 
@@ -911,6 +955,11 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db),
                         a["warning"] = f"{item_name} stock mein nahi hai."
                     else:
                         a["item"] = db_item.name
+                        rate = (to_float(a.get("price"))
+                                or float(db_item.sale_price or 0.0))
+                        qty, rate = qty_from_amount(a, db_item, qty, rate)
+                        if qty is None:
+                            continue
                         qty = resolve_qty(a, db_item, qty)
                         if qty is None:
                             continue
@@ -919,8 +968,6 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db),
                                 f"Sirf {db_item.quantity:g} {db_item.unit} "
                                 f"{db_item.name} bacha hai.")
                         else:
-                            rate = (to_float(a.get("price"))
-                                    or float(db_item.sale_price or 0.0))
                             a["unit_price"] = rate
                             a["amount"] = round(qty * rate, 2)
                             if rate <= 0:
@@ -949,6 +996,12 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db),
                     if not db_item:
                         a["warning"] = f"{item_name} stock mein nahi hai."
                     else:
+                        rate = (to_float(a.get("price"))
+                                or float(db_item.sale_price or 0.0))
+                        # "100 ke chini" carries money, not a quantity.
+                        qty, rate = qty_from_amount(a, db_item, qty, rate)
+                        if qty is None:
+                            continue
                         qty = resolve_qty(a, db_item, qty)
                         if qty is None:
                             continue
@@ -957,8 +1010,6 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db),
                                 f"Sirf {db_item.quantity:g} {db_item.unit} "
                                 f"{db_item.name} bacha hai.")
                         else:
-                            rate = (to_float(a.get("price"))
-                                    or float(db_item.sale_price or 0.0))
                             a["unit_price"] = rate
                             a["line_total"] = round(qty * rate, 2)
 
@@ -994,10 +1045,22 @@ def execute_actions(actions, db, uid):
 
             item_name = (a.get("item") or "").strip()
             qty = to_float(a.get("qty"))
-            if qty <= 0:
-                raise ValueError(f"Invalid quantity for {item_name}")
 
             db_item = find_item(db, item_name, uid, allow_partial=True)
+
+            # A value-based sale ("100 ke chini") arrives with qty 0 and a
+            # money amount. The parse phase normally converts it, but never
+            # trust the client to have done so.
+            if qty <= 0 and db_item is not None:
+                money = to_float(a.get("amount"))
+                rate = (to_float(a.get("unit_price"))
+                        or to_float(a.get("price"))
+                        or float(db_item.sale_price or 0.0))
+                if money > 0 and rate > 0:
+                    qty = round(money / rate, 3)
+
+            if qty <= 0:
+                raise ValueError(f"Invalid quantity for {item_name}")
 
             if not db_item:
                 if action == "STOCK_OUT":
