@@ -115,3 +115,25 @@ class Shop(Base):
     shop_name = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.datetime.utcnow)
+
+class CashEntry(Base):
+    """A manual movement of cash in or out of the drawer.
+
+    Sales recorded through voice, scans or the stock screens are NOT stored
+    here — they already live in `transactions`, and the cash summary adds
+    them in. This table holds only what has no other home: expenses, owner
+    withdrawals, money added from outside, a float at opening.
+    """
+    __tablename__ = "cash_entries"
+    id = Column(Integer, primary_key=True, index=True)
+    owner_uid = Column(String, index=True, nullable=True)
+    type = Column(String)            # 'in' or 'out'
+    amount = Column(Float, default=0.0)
+    category = Column(String, default="other")
+    note = Column(String, nullable=True)
+
+    # When the cash actually moved. Separate from created_at so a
+    # shopkeeper can record yesterday's electricity bill today.
+    occurred_at = Column(DateTime, default=datetime.datetime.utcnow,
+                         index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)

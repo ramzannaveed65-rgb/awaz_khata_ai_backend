@@ -1487,6 +1487,175 @@ def credit_sale(customer_id: int, body: CreditSale,
 
 
 # -------------------------------------------------------------------------
+# CASH BOOK
+# -------------------------------------------------------------------------
+class CashIn(BaseModel):
+    type: str                       # 'in' or 'out'
+    amount: float
+    category: str | None = None
+    note: str | None = None
+    # ISO-8601 with an offset or a trailing Z. Omit to mean "now".
+    occurred_at: str | None = None
+
+
+def _parse_client_time(value):
+    """Accept an ISO string from the app and return naive UTC.
+
+    The app sends DateTime.toUtc().toIso8601String(), which ends in "Z".
+    A string with no offset at all is treated as Pakistan time rather than
+    UTC, since that is what a shopkeeper would have meant.
+    """
+    if not value:
+        return datetime.datetime.utcnow()
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400,
+                            detail="occurred_at must be an ISO date-time")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=PKT)
+    return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+
+def _sales_cash_for_day(db, uid, start, end):
+    """Cash that came in through sales, the same figure the daily report
+    calls cash_in_hand: sales, minus the part sold on credit, plus any
+    khata repayments received.
+
+    Computing it here rather than asking the app to add it means the Cash
+    Book and the Sales Report can never disagree about the same day.
+    """
+    sales = owned(db, models.StockTransaction, uid).filter(
+        models.StockTransaction.type == 'out',
+        models.StockTransaction.timestamp >= start,
+        models.StockTransaction.timestamp < end,
+    ).all()
+    revenue = sum(s.total_amount or 0.0 for s in sales)
+
+    khata = owned(db, models.KhataEntry, uid).filter(
+        models.KhataEntry.timestamp >= start,
+        models.KhataEntry.timestamp < end,
+    ).all()
+    # ALL udhaar leaves the drawer short: goods on credit were counted as
+    # revenue but brought no cash, and cash lent out physically left.
+    # Matches how /reports/daily computes cash_in_hand.
+    credit = sum(k.amount or 0.0 for k in khata if k.type == 'udhaar')
+    repaid = sum(k.amount or 0.0 for k in khata if k.type == 'jama')
+
+    return round(revenue, 2), round(credit, 2), round(repaid, 2)
+
+
+@app.get("/cash/day")
+def cash_day(date: str | None = Query(None,
+                                      description="YYYY-MM-DD, defaults to today"),
+             db: Session = Depends(get_db),
+             uid: str = Depends(get_uid)):
+    """Everything that moved cash on one day: manual entries plus a single
+    rolled-up line for sales, so the drawer figure is complete."""
+    day = None
+    if date:
+        try:
+            day = datetime.datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail="date must be YYYY-MM-DD")
+    start, end, day = pkt_day_bounds(day)
+
+    rows = (owned(db, models.CashEntry, uid)
+            .filter(models.CashEntry.occurred_at >= start,
+                    models.CashEntry.occurred_at < end)
+            .order_by(models.CashEntry.occurred_at.desc()).all())
+
+    manual_in = sum(r.amount or 0.0 for r in rows if r.type == 'in')
+    manual_out = sum(r.amount or 0.0 for r in rows if r.type == 'out')
+
+    revenue, credit, repaid = _sales_cash_for_day(db, uid, start, end)
+    sales_cash = round(revenue - credit + repaid, 2)
+
+    total_in = round(manual_in + sales_cash, 2)
+    total_out = round(manual_out, 2)
+
+    return {
+        "date": day.isoformat(),
+        "net": round(total_in - total_out, 2),
+        "total_in": total_in,
+        "total_out": total_out,
+        "sales_cash": sales_cash,
+        "sales_revenue": revenue,
+        "credit_given": credit,
+        "payments_received": repaid,
+        "manual_in": round(manual_in, 2),
+        "manual_out": round(manual_out, 2),
+        "entry_count": len(rows),
+        "entries": [{
+            "id": r.id,
+            "type": r.type,
+            "amount": float(r.amount or 0.0),
+            "category": r.category or "other",
+            "note": r.note,
+            "occurred_at": to_pkt(r.occurred_at).isoformat(),
+        } for r in rows],
+    }
+
+
+@app.get("/cash/balance")
+def cash_balance(db: Session = Depends(get_db),
+                 uid: str = Depends(get_uid)):
+    """All-time cash position: every sale that brought cash in, every khata
+    repayment, and every manual entry either way."""
+    sales = owned(db, models.StockTransaction, uid).filter(
+        models.StockTransaction.type == 'out').all()
+    revenue = sum(s.total_amount or 0.0 for s in sales)
+
+    khata = owned(db, models.KhataEntry, uid).all()
+    credit = sum(k.amount or 0.0 for k in khata if k.type == 'udhaar')
+    repaid = sum(k.amount or 0.0 for k in khata if k.type == 'jama')
+
+    manual = owned(db, models.CashEntry, uid).all()
+    manual_in = sum(m.amount or 0.0 for m in manual if m.type == 'in')
+    manual_out = sum(m.amount or 0.0 for m in manual if m.type == 'out')
+
+    return {"balance": round(revenue - credit + repaid
+                             + manual_in - manual_out, 2)}
+
+
+@app.post("/cash/entries")
+def add_cash_entry(body: CashIn, db: Session = Depends(get_db),
+                   uid: str = Depends(get_uid)):
+    entry_type = (body.type or "").strip().lower()
+    if entry_type not in ("in", "out"):
+        raise HTTPException(status_code=400,
+                            detail="type must be 'in' or 'out'")
+    if body.amount <= 0:
+        raise HTTPException(status_code=400,
+                            detail="Amount must be greater than zero")
+
+    entry = models.CashEntry(
+        owner_uid=uid,
+        type=entry_type,
+        amount=body.amount,
+        category=(body.category or "other").strip().lower(),
+        note=(body.note or "").strip() or None,
+        occurred_at=_parse_client_time(body.occurred_at),
+    )
+    db.add(entry)
+    db.commit()
+    return {"status": "success", "id": entry.id}
+
+
+@app.delete("/cash/entries/{entry_id}")
+def delete_cash_entry(entry_id: int, db: Session = Depends(get_db),
+                      uid: str = Depends(get_uid)):
+    entry = owned(db, models.CashEntry, uid).filter(
+        models.CashEntry.id == entry_id).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    db.delete(entry)
+    db.commit()
+    return {"status": "success"}
+
+
+# -------------------------------------------------------------------------
 # 5. REPORTS
 # -------------------------------------------------------------------------
 @app.get("/reports/daily")
