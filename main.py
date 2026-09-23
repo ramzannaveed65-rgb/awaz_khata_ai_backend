@@ -578,12 +578,15 @@ async def ai_generate(contents, label="ai"):
 
     for attempt in range(AI_ATTEMPTS):
         try:
+            call_started = time.perf_counter()
             response = await asyncio.to_thread(
                 client.models.generate_content,
                 model=MODEL_NAME,
                 contents=contents,
                 config={'response_mime_type': 'application/json'},
             )
+            _ai_seconds.set(_ai_seconds.get()
+                            + (time.perf_counter() - call_started))
             if response and response.text and response.text.strip():
                 return clean_json_response(response.text)
 
@@ -663,6 +666,33 @@ def home():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# -------------------------------------------------------------------------
+# REQUEST TIMING
+# -------------------------------------------------------------------------
+# Logs how long each request took, and separately how long was spent inside
+# Gemini. Without this the logs show which requests succeeded but not where
+# the seconds went — and a slow command could be the model, the database,
+# token verification, or the phone before the request even leaves.
+import time
+from contextvars import ContextVar
+
+_ai_seconds: ContextVar[float] = ContextVar("ai_seconds", default=0.0)
+
+
+@app.middleware("http")
+async def log_timing(request, call_next):
+    _ai_seconds.set(0.0)
+    started = time.perf_counter()
+    response = await call_next(request)
+    total = time.perf_counter() - started
+
+    ai = _ai_seconds.get()
+    if total > 0.5 or ai > 0:
+        log.info("timing: %s %s took %.2fs (gemini %.2fs, server %.2fs)",
+                 request.method, request.url.path, total, ai, total - ai)
+    return response
 
 
 # -------------------------------------------------------------------------
