@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import datetime
 import io
 import asyncio
@@ -92,8 +93,13 @@ def get_uid(authorization: str | None = Header(None)) -> str:
         raise HTTPException(status_code=401, detail="Sign in required")
 
     token = authorization.split(" ", 1)[1].strip()
+    auth_started = time.perf_counter()
     try:
         decoded = fb_auth.verify_id_token(token)
+        auth_seconds = time.perf_counter() - auth_started
+        if auth_seconds > 0.5:
+            log.warning("timing: token verification took %.2fs",
+                        auth_seconds)
     except fb_auth.ExpiredIdTokenError:
         raise HTTPException(status_code=401,
                             detail="Session expired. Please sign in again.")
@@ -585,8 +591,8 @@ async def ai_generate(contents, label="ai"):
                 contents=contents,
                 config={'response_mime_type': 'application/json'},
             )
-            _ai_seconds.set(_ai_seconds.get()
-                            + (time.perf_counter() - call_started))
+            log.info("timing: %s gemini call %.2fs (attempt %s)",
+                     label, time.perf_counter() - call_started, attempt + 1)
             if response and response.text and response.text.strip():
                 return clean_json_response(response.text)
 
@@ -675,23 +681,14 @@ def health():
 # Gemini. Without this the logs show which requests succeeded but not where
 # the seconds went — and a slow command could be the model, the database,
 # token verification, or the phone before the request even leaves.
-import time
-from contextvars import ContextVar
-
-_ai_seconds: ContextVar[float] = ContextVar("ai_seconds", default=0.0)
-
-
 @app.middleware("http")
 async def log_timing(request, call_next):
-    _ai_seconds.set(0.0)
     started = time.perf_counter()
     response = await call_next(request)
     total = time.perf_counter() - started
-
-    ai = _ai_seconds.get()
-    if total > 0.5 or ai > 0:
-        log.info("timing: %s %s took %.2fs (gemini %.2fs, server %.2fs)",
-                 request.method, request.url.path, total, ai, total - ai)
+    if total > 0.5:
+        log.info("timing: %s %s took %.2fs",
+                 request.method, request.url.path, total)
     return response
 
 
