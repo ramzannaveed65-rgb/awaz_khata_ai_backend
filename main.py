@@ -1161,22 +1161,20 @@ def execute_actions(actions, db, uid):
                 total_amount=line_total,
             ))
 
+            # Stock changes are NOT spoken aloud. The shopkeeper is looking
+            # at the phone when they tap Save, the snackbar already says what
+            # happened, and waiting for the phone to read it back adds
+            # seconds to every sale. Khata entries still speak, because the
+            # balance afterwards is worth hearing without reading.
             if action == "STOCK_OUT":
                 results.append(
                     f"Sold {qty:g} {db_item.unit} {db_item.name} — "
                     f"Rs {line_total:,.0f} "
                     f"({db_item.quantity:g} {db_item.unit} left)")
-                spoken.append(
-                    f"{qty:g} {db_item.unit} {db_item.name} bech di, "
-                    f"{_spoken_number(line_total)} rupay. "
-                    f"{db_item.quantity:g} {db_item.unit} bacha hai.")
             else:
                 results.append(
                     f"Added {qty:g} {db_item.unit} {db_item.name} "
                     f"({db_item.quantity:g} {db_item.unit} in stock)")
-                spoken.append(
-                    f"{qty:g} {db_item.unit} {db_item.name} stock mein "
-                    f"add ho gaya. Ab {db_item.quantity:g} {db_item.unit} hai.")
 
         db.commit()
         return {
