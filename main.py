@@ -243,11 +243,42 @@ MODEL_NAME = "models/gemini-3.5-flash-lite"
 
 MAX_IMAGE_EDGE = 1600
 
-AI_ATTEMPTS = 4
-AI_BACKOFF = [2, 4, 8]
+AI_ATTEMPTS = 3
+
+# Two ladders, because the two failure modes deserve different patience.
+# A 429/503 means Google is loaded and needs real time to recover. A timeout
+# means this particular request went bad, and a fresh one usually lands in
+# about a second — so waiting 4s before retrying only adds to the delay.
+AI_BUSY_BACKOFF = [2, 4]
+AI_TIMEOUT_BACKOFF = [0.5, 1.5]
+
+# Per-attempt ceiling, in milliseconds.
+#
+# Measured on live traffic, a voice call has a median of 1.06s and a 90th
+# percentile near 1.5s, but a long tail: 14.79s, 34.34s and 48.64s all on the
+# FIRST attempt, no retries involved. With no ceiling the server simply waits
+# and the shopkeeper watches a spinner for 50 seconds.
+#
+# 8s is more than five times the 90th percentile, so it abandons only the
+# pathological tail and never a call that was going to succeed normally.
+#
+# Bill scanning must NOT share that number — sending an image legitimately
+# takes 10-20s, so an 8s ceiling would break every scan.
+AI_TIMEOUT_MS = {
+    "voice": 8_000,
+    "scan-bill": 60_000,
+    "warmup": 30_000,
+}
+DEFAULT_AI_TIMEOUT_MS = 20_000
 
 BUSY_MARKERS = ("503", "429", "overload", "unavailable", "quota",
                 "rate limit", "resource_exhausted")
+
+# A timeout is retryable, but it is not a "busy" error — Google never gets to
+# tell us anything. Without these markers the retry loop would re-raise and
+# the caller would see a 500 instead of a second attempt.
+TIMEOUT_MARKERS = ("timeout", "timed out", "deadline", "504",
+                   "read operation", "connection reset", "connection aborted")
 
 # A single line on a kiryana bill should never legitimately exceed this.
 MAX_SANE_LINE_AMOUNT = 500_000
@@ -576,20 +607,46 @@ def _is_busy_error(err):
     return any(marker in msg for marker in BUSY_MARKERS)
 
 
-async def ai_generate(contents, label="ai"):
-    """Single place where Gemini is called. Runs the synchronous SDK call in
-    a worker thread so it does not block the event loop, retries on busy
-    errors, and never returns an empty string."""
+def _is_timeout_error(err):
+    msg = str(err).lower()
+    return any(marker in msg for marker in TIMEOUT_MARKERS)
+
+
+async def ai_generate(contents, label="ai", timeout_ms=None):
+    """Single place where Gemini is called.
+
+    Runs the synchronous SDK call in a worker thread so it does not block the
+    event loop, gives every attempt a hard deadline, retries on busy errors
+    and timeouts, and never returns an empty string.
+
+    The deadline is enforced by the SDK's own HTTP client, deliberately — NOT
+    by asyncio.wait_for. wait_for would hand control back to the event loop
+    while leaving the worker thread blocked on the socket, so a run of slow
+    calls would quietly consume the whole thread pool and every later request
+    would queue behind them. Timing out inside the SDK ends the thread too.
+    """
+    budget_ms = timeout_ms or AI_TIMEOUT_MS.get(label, DEFAULT_AI_TIMEOUT_MS)
+
+    config = {
+        'response_mime_type': 'application/json',
+        'http_options': {'timeout': budget_ms},
+        # Nothing here uses tool calling, and the SDK logs a warning about it
+        # on every single request. Turning it off removes a code path this app
+        # does not want and quiets the log.
+        'automatic_function_calling': {'disable': True},
+    }
+
     last_error = None
 
     for attempt in range(AI_ATTEMPTS):
+        timed_out = False
         try:
             call_started = time.perf_counter()
             response = await asyncio.to_thread(
                 client.models.generate_content,
                 model=MODEL_NAME,
                 contents=contents,
-                config={'response_mime_type': 'application/json'},
+                config=config,
             )
             log.info("timing: %s gemini call %.2fs (attempt %s)",
                      label, time.perf_counter() - call_started, attempt + 1)
@@ -601,14 +658,22 @@ async def ai_generate(contents, label="ai"):
                         label, attempt + 1, AI_ATTEMPTS)
 
         except Exception as e:
-            if not _is_busy_error(e):
+            timed_out = _is_timeout_error(e)
+            if not timed_out and not _is_busy_error(e):
                 raise
             last_error = str(e)
-            log.warning("%s: Google busy, attempt %s/%s",
-                        label, attempt + 1, AI_ATTEMPTS)
+            elapsed = time.perf_counter() - call_started
+            if timed_out:
+                log.warning("%s: abandoned after %.1fs, retrying "
+                            "(attempt %s/%s)",
+                            label, elapsed, attempt + 1, AI_ATTEMPTS)
+            else:
+                log.warning("%s: Google busy, attempt %s/%s",
+                            label, attempt + 1, AI_ATTEMPTS)
 
         if attempt < AI_ATTEMPTS - 1:
-            await asyncio.sleep(AI_BACKOFF[attempt])
+            ladder = AI_TIMEOUT_BACKOFF if timed_out else AI_BUSY_BACKOFF
+            await asyncio.sleep(ladder[attempt])
 
     log.error("%s: all %s attempts failed. Last: %s",
               label, AI_ATTEMPTS, last_error)
@@ -616,6 +681,26 @@ async def ai_generate(contents, label="ai"):
         status_code=503,
         detail="AI service is busy right now. Please try again in a moment.",
     )
+
+
+# The 34.34s call in the logs was the first request after "Application startup
+# complete": TLS handshake, SDK client construction and model warm-up all
+# landing on whoever spoke first. Paying that at boot instead means the first
+# real command is as fast as the second.
+#
+# Fired as a background task so a slow or failed warm-up cannot delay the
+# container becoming ready — Railway would otherwise mark the deploy unhealthy
+# while this waits.
+@app.on_event("startup")
+async def warm_up_ai():
+    async def _warm():
+        try:
+            await ai_generate('Return exactly this JSON: []', label="warmup")
+            log.info("warmup: gemini ready")
+        except Exception as e:
+            log.warning("warmup: skipped (%s)", e)
+
+    asyncio.create_task(_warm())
 
 
 def parse_ai_json(text_in, label="ai"):
