@@ -863,6 +863,14 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db),
     KHATA (customer credit ledger) — these ALWAYS name a person:
     - 'X ko ... udhaar', 'X ko ... dediya', 'X ke khate mein likho'
         -> "KHATA_UDHAAR"  (customer took goods or cash on credit)
+
+    DECIDING BETWEEN STOCK AND KHATA — read this carefully:
+    If the command mentions a PERSON'S KHATA or ACCOUNT, it is a KHATA
+    action even when it also uses a word like "add karo". The word "khata"
+    or "khate" next to a name always wins.
+    "Ahmed ke khate mein 2 kilo ghee add kar do" is KHATA_UDHAAR, NOT
+    STOCK_IN — goods are leaving the shop to Ahmed on credit.
+    "2 kilo ghee add kar do" with no person named is STOCK_IN.
     - 'X ne ... rupay diye', 'X ne payment ki', 'X se ... mila'
         -> "KHATA_JAMA"    (customer paid money back)
     - 'X ka hisab', 'X kitna deta hai', 'X ka balance'
@@ -1054,9 +1062,24 @@ async def process_voice(data: VoiceInput, db: Session = Depends(get_db),
                             detail="Failed to process voice intent")
 
 
+def _balance_phrase(name, balance):
+    """The running balance, spoken the way a shopkeeper would say it."""
+    if balance > 0:
+        return f" Ab {name} ne {balance:,.0f} rupay dene hain."
+    if balance < 0:
+        return f" Ab aap ne {name} ko {abs(balance):,.0f} rupay dene hain."
+    return f" {name} ka hisab saaf hai."
+
+
+def _spoken_number(value):
+    """Rupees read aloud should not carry decimals nobody says."""
+    return f"{value:,.0f}"
+
+
 def execute_actions(actions, db, uid):
     """Commits confirmed write actions. All-or-nothing."""
     results = []
+    spoken = []
     sale_total = 0.0
     try:
         for a in actions:
@@ -1065,8 +1088,9 @@ def execute_actions(actions, db, uid):
                 continue
 
             if action in ("KHATA_UDHAAR", "KHATA_JAMA"):
-                line, credited = _commit_khata(a, db, uid)
+                line, credited, said = _commit_khata(a, db, uid)
                 results.append(line)
+                spoken.append(said)
                 sale_total += credited
                 continue
 
@@ -1142,15 +1166,28 @@ def execute_actions(actions, db, uid):
                     f"Sold {qty:g} {db_item.unit} {db_item.name} — "
                     f"Rs {line_total:,.0f} "
                     f"({db_item.quantity:g} {db_item.unit} left)")
+                spoken.append(
+                    f"{qty:g} {db_item.unit} {db_item.name} bech di, "
+                    f"{_spoken_number(line_total)} rupay. "
+                    f"{db_item.quantity:g} {db_item.unit} bacha hai.")
             else:
                 results.append(
                     f"Added {qty:g} {db_item.unit} {db_item.name} "
                     f"({db_item.quantity:g} {db_item.unit} in stock)")
+                spoken.append(
+                    f"{qty:g} {db_item.unit} {db_item.name} stock mein "
+                    f"add ho gaya. Ab {db_item.quantity:g} {db_item.unit} hai.")
 
         db.commit()
         return {
             "status": "success",
             "results": results,
+            # What the server ACTUALLY did, phrased for speaking aloud.
+            # The model's own voice_response describes what it believed the
+            # command meant, which is not the same thing: a command the model
+            # read as a khata entry but executed as a stock addition would
+            # otherwise be confirmed out loud as a khata entry.
+            "spoken": spoken,
             "sale_total": round(sale_total, 2),
         }
 
@@ -1162,7 +1199,9 @@ def execute_actions(actions, db, uid):
 
 
 def _commit_khata(a, db, uid):
-    """Writes one khata entry. Returns (summary line, revenue recognised).
+    """Writes one khata entry.
+
+    Returns (summary line, revenue recognised, spoken confirmation).
 
     Goods given on credit are a SALE — stock leaves and the shop has earned
     the money, it just has not been paid yet. So this writes both a
@@ -1201,8 +1240,17 @@ def _commit_khata(a, db, uid):
         db.flush()
         bal = customer_balance(db, cust.id, uid)
         verb = "paid" if action == "KHATA_JAMA" else "took"
+
+        if action == "KHATA_JAMA":
+            said = (f"{cust.name} se {_spoken_number(amount)} rupay wasool "
+                    f"huye.")
+        else:
+            said = (f"{cust.name} ke khate mein {_spoken_number(amount)} "
+                    f"rupay udhaar likh diya.")
+        said += _balance_phrase(cust.name, bal)
+
         return (f"{cust.name} {verb} Rs {amount:,.0f} "
-                f"(balance Rs {bal:,.0f})"), revenue
+                f"(balance Rs {bal:,.0f})"), revenue, said
 
     # --- goods on credit ---
     db_item = find_item(db, item_name, uid, allow_partial=True)
@@ -1251,8 +1299,13 @@ def _commit_khata(a, db, uid):
 
     db.flush()
     bal = customer_balance(db, cust.id, uid)
+    said = (f"{cust.name} ke khate mein {qty:g} {db_item.unit} "
+            f"{db_item.name} likh diya, {_spoken_number(line_total)} rupay.")
+    said += _balance_phrase(cust.name, bal)
+
     return (f"{cust.name} took {qty:g} {db_item.unit} {db_item.name} "
-            f"on credit — Rs {line_total:,.0f} (balance Rs {bal:,.0f})"), revenue
+            f"on credit — Rs {line_total:,.0f} (balance Rs {bal:,.0f})"), \
+        revenue, said
 
 
 # -------------------------------------------------------------------------
