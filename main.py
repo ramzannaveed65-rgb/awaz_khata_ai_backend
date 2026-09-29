@@ -259,13 +259,19 @@ AI_TIMEOUT_BACKOFF = [0.5, 1.5]
 # FIRST attempt, no retries involved. With no ceiling the server simply waits
 # and the shopkeeper watches a spinner for 50 seconds.
 #
-# 8s is more than five times the 90th percentile, so it abandons only the
-# pathological tail and never a call that was going to succeed normally.
+# Google REJECTS any deadline below 10s outright:
+#   400 INVALID_ARGUMENT — "Manually set deadline 8s is too short.
+#   Minimum allowed deadline is 10s."
+# An 8s budget therefore did not time out; it failed every single request
+# before the model ran at all. 12s keeps clear of that floor while still
+# abandoning only the pathological tail — the 90th percentile is near 1.5s.
 #
 # Bill scanning must NOT share that number — sending an image legitimately
-# takes 10-20s, so an 8s ceiling would break every scan.
+# takes 10-20s, so a short ceiling would break every scan.
+GEMINI_MIN_DEADLINE_MS = 10_000
+
 AI_TIMEOUT_MS = {
-    "voice": 8_000,
+    "voice": 12_000,
     "scan-bill": 60_000,
     "warmup": 30_000,
 }
@@ -279,6 +285,16 @@ BUSY_MARKERS = ("503", "429", "overload", "unavailable", "quota",
 # the caller would see a 500 instead of a second attempt.
 TIMEOUT_MARKERS = ("timeout", "timed out", "deadline", "504",
                    "read operation", "connection reset", "connection aborted")
+
+# Errors that retrying cannot possibly fix: a malformed request, a bad key,
+# a model name that does not exist. These must surface immediately.
+#
+# Checked BEFORE the timeout markers, because the message Google returns for
+# a rejected deadline contains the word "deadline" and was being mistaken for
+# a timeout — so a permanent configuration error was retried three times and
+# then reported to the shopkeeper as "AI service is busy", which it was not.
+FATAL_MARKERS = ("invalid_argument", "permission_denied", "unauthenticated",
+                 "api key not valid", "api_key_invalid", "not_found")
 
 # A single line on a kiryana bill should never legitimately exceed this.
 MAX_SANE_LINE_AMOUNT = 500_000
@@ -612,6 +628,11 @@ def _is_timeout_error(err):
     return any(marker in msg for marker in TIMEOUT_MARKERS)
 
 
+def _is_fatal_error(err):
+    msg = str(err).lower()
+    return any(marker in msg for marker in FATAL_MARKERS)
+
+
 async def ai_generate(contents, label="ai", timeout_ms=None):
     """Single place where Gemini is called.
 
@@ -626,6 +647,9 @@ async def ai_generate(contents, label="ai", timeout_ms=None):
     would queue behind them. Timing out inside the SDK ends the thread too.
     """
     budget_ms = timeout_ms or AI_TIMEOUT_MS.get(label, DEFAULT_AI_TIMEOUT_MS)
+    # Below Google's floor the request is rejected outright rather than
+    # given a shorter deadline, so clamp instead of trusting the caller.
+    budget_ms = max(budget_ms, GEMINI_MIN_DEADLINE_MS)
 
     config = {
         'response_mime_type': 'application/json',
@@ -658,6 +682,11 @@ async def ai_generate(contents, label="ai", timeout_ms=None):
                         label, attempt + 1, AI_ATTEMPTS)
 
         except Exception as e:
+            # Checked first: a rejected deadline reports itself using the
+            # word "deadline" and would otherwise look like a timeout.
+            if _is_fatal_error(e):
+                log.error("%s: unrecoverable, not retrying: %s", label, e)
+                raise
             timed_out = _is_timeout_error(e)
             if not timed_out and not _is_busy_error(e):
                 raise
